@@ -48,6 +48,10 @@
 
 ;;; connection
 
+;; the postgres driver is reached through pgfn, defined with the other pg helpers
+;; below; connection calls it for the :postgresql branch.
+(declare pgfn)
+
 (defn connection
   "Open a connection. spec is a uri string (\"sqlite:path\", a bare sqlite
   path, or \"postgres://user:pass@host:port/db\") or a dbspec map with
