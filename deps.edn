@@ -16,4 +16,4 @@
  :aliases {:test {:extra-paths ["clj-test"]
                   :main-opts ["-m" "jdbc.core-test"]}}
 
- :tasks {test "joltc -M:test"}}
+ :tasks {test "jolt -M:test"}}
