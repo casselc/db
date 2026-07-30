@@ -48,6 +48,48 @@
 
 ;;; connection
 
+(defn- new-transaction-state []
+  (atom {:depth 0
+         :rollback? false
+         :cleanup-errors []
+         :pending-cleanup? false
+         :poisoned? false}))
+
+(defn- cleanup-context [errors]
+  (mapv #(select-keys % [:phase :sql]) errors))
+
+(def ^:dynamic ^:private *transaction-cleanup-command?* false)
+
+(defn- poisoned-transaction-exception [state]
+  (let [errors (:cleanup-errors @state)]
+    (ex-info "connection transaction state is indeterminate; close connection"
+             {:jdbc/transaction-poisoned true
+              :jdbc/close-required true
+              :jdbc/transaction-cleanup (cleanup-context errors)}
+             (:error (first errors)))))
+
+(defn- pending-cleanup-operation-exception [state]
+  (let [errors (:cleanup-errors @state)]
+    (ex-info
+      "transaction cleanup is pending; operation rejected until encompassing rollback"
+      {:jdbc/transaction-cleanup-pending true
+       :jdbc/transaction-cleanup (cleanup-context errors)}
+      (:error (first errors)))))
+
+(defn- ensure-transaction-usable! [conn]
+  (when-let [state (:tx-state conn)]
+    (let [snapshot @state]
+      (cond
+        (:poisoned? snapshot)
+        (throw (poisoned-transaction-exception state))
+
+        (and (:pending-cleanup? snapshot)
+             (not *transaction-cleanup-command?*))
+        (throw (pending-cleanup-operation-exception state)))))
+  conn)
+
+(declare pgfn)
+
 (defn connection
   "Open a connection. spec is a uri string (\"sqlite:path\", a bare sqlite
   path, or \"postgres://user:pass@host:port/db\") or a dbspec map with
@@ -61,8 +103,7 @@
         (sqlite/query h "PRAGMA foreign_keys=1;" [])
         {:vendor   :sqlite
          :handle   h
-         :depth    (atom 0)
-         :rollback (atom false)
+         :tx-state (new-transaction-state)
          :close    (fn [] (sqlite/close h))})
       "postgresql"
       ;; db.pg (and libpq) load lazily — only when a postgres connection is made,
@@ -71,8 +112,7 @@
           (let [h ((pgfn "connect") (pg-uri spec))]
             {:vendor   :postgresql
              :handle   h
-             :depth    (atom 0)
-             :rollback (atom false)
+             :tx-state (new-transaction-state)
              :close    (fn [] ((pgfn "close") h))})))))
 
 ;;; queries
@@ -109,6 +149,7 @@
   "Run a query (string or sqlvec), return a vector of keyword-keyed row maps."
   ([conn q] (fetch conn q {}))
   ([conn q opts]
+   (ensure-transaction-usable! conn)
    (let [[sql params] (sqlvec q)
          rows (case (:vendor conn)
                 :sqlite     (sqlite-eval conn sql params)
@@ -124,6 +165,7 @@
   "Execute a statement (string or sqlvec). Returns rows affected."
   ([conn q] (execute! conn q {}))
   ([conn q opts]
+   (ensure-transaction-usable! conn)
    (let [[sql params] (sqlvec q)]
      (case (:vendor conn)
        :sqlite     (do (sqlite-eval conn sql params)
@@ -133,6 +175,7 @@
 (defn last-insert-id
   "Driver-specific id of the last inserted row (sqlite: last_insert_rowid)."
   [conn]
+  (ensure-transaction-usable! conn)
   (case (:vendor conn)
     :sqlite     (sqlite/last-insert-rowid (:handle conn))
     :postgresql (:id (first ((pgfn "all") (:handle conn) "select lastval() as id" [])))))
@@ -187,33 +230,141 @@
 (defn set-rollback!
   "Mark the current transaction to roll back at the end of the atomic block."
   [conn]
-  (reset! (:rollback conn) true)
+  (ensure-transaction-usable! conn)
+  (swap! (:tx-state conn) assoc :rollback? true)
   conn)
 
+(defn transaction-cleanup-errors
+  "Cleanup failures retained from the most recent outer transaction attempt.
+  Each entry contains :phase, :sql, and the original :error. A new outer
+  transaction clears the entries after BEGIN succeeds. If an outer cleanup
+  failure leaves the connection poisoned, this accessor and :close remain
+  usable but query and transaction operations fail closed."
+  [conn]
+  (:cleanup-errors @(:tx-state conn)))
+
+(defn- command-error [conn sql]
+  (try
+    ;; Public operations fail closed while nested cleanup is pending. Only the
+    ;; transaction machinery may issue the rollback/release that resolves it.
+    (binding [*transaction-cleanup-command?* true]
+      (execute! conn sql))
+    nil
+    (catch Throwable t t)))
+
+(defn- record-cleanup-error! [state phase sql error poison?]
+  (swap! state
+         (fn [s]
+           (let [next-state
+                 (-> s
+                     (assoc :rollback? true)
+                     (update :cleanup-errors conj
+                             {:phase phase :sql sql :error error}))]
+             (if poison?
+               (assoc next-state
+                      :pending-cleanup? false
+                      :poisoned? true)
+               (assoc next-state :pending-cleanup? true)))))
+  error)
+
+(defn- cleanup-boundary!
+  "Best-effort cleanup for one begun boundary. Nested rollback leaves its
+  savepoint active, so a successful ROLLBACK TO must be followed by RELEASE."
+  [conn state depth rollback release rollback-phase]
+  (if-let [error (command-error conn rollback)]
+    (do
+      (record-cleanup-error! state rollback-phase rollback error (zero? depth))
+      false)
+    (if (pos? depth)
+      (if-let [error (command-error conn release)]
+        (do
+          (record-cleanup-error! state :release-after-rollback release error false)
+          false)
+        true)
+      (do
+        ;; A real encompassing rollback resolves any indeterminate nested
+        ;; boundary. Historical cleanup context remains available to the caller.
+        (swap! state assoc
+               :pending-cleanup? false
+               :poisoned? false)
+        true))))
+
+(defn- pending-cleanup-exception [errors]
+  (let [first-error (first errors)]
+    (ex-info "transaction cleanup failed"
+             {:jdbc/transaction-cleanup (cleanup-context errors)}
+             (:error first-error))))
+
 (defn atomic-apply
-  "Run (func conn) in a transaction; nested calls use savepoints."
+  "Run (func conn) in a transaction; nested calls use savepoints.
+
+  Transaction bookkeeping is reentrant for one owning call chain. Concurrent
+  use of the same connection is outside this function's contract."
   ([conn func] (atomic-apply conn func {}))
   ([conn func opts]
-   (let [depth @(:depth conn)
+   (ensure-transaction-usable! conn)
+   (let [state (:tx-state conn)
+         depth (:depth @state)
          sp (str "jdbc_sp_" depth)
          begin (if (zero? depth) "BEGIN" (str "SAVEPOINT " sp))
          commit (if (zero? depth) "COMMIT" (str "RELEASE SAVEPOINT " sp))
-         rollback (if (zero? depth) "ROLLBACK" (str "ROLLBACK TO SAVEPOINT " sp))]
+         rollback (if (zero? depth) "ROLLBACK" (str "ROLLBACK TO SAVEPOINT " sp))
+         release (str "RELEASE SAVEPOINT " sp)]
      (execute! conn begin)
-     (swap! (:depth conn) inc)
-     (try
-       (let [ret (func conn)]
-         (swap! (:depth conn) dec)
-         (if (and (zero? @(:depth conn)) @(:rollback conn))
-           (do (reset! (:rollback conn) false)
-               (execute! conn rollback))
-           (execute! conn commit))
-         ret)
-       (catch Throwable t
-         (swap! (:depth conn) dec)
-         (execute! conn rollback)
-         (when (zero? @(:depth conn)) (reset! (:rollback conn) false))
-         (throw t))))))
+     (swap! state
+            (fn [s]
+              (cond-> (assoc s :depth (inc (:depth s)))
+                (zero? depth) (assoc :cleanup-errors []
+                                     :pending-cleanup? false))))
+     (let [body-outcome
+           (try
+             {:value (func conn)}
+             (catch Throwable t {:error t}))]
+       (try
+         (if-let [body-error (:error body-outcome)]
+           (do
+             (cleanup-boundary! conn state depth rollback release :rollback)
+             ;; Cleanup context is retained on conn; preserve the exact body
+             ;; throwable as the primary exception.
+             (throw body-error))
+           (let [ret (:value body-outcome)
+                 snapshot @state
+                 pending (seq (:cleanup-errors snapshot))]
+             (cond
+               ;; A deeper boundary failed cleanup and its body error was caught
+               ;; by user code. Do not commit through an indeterminate boundary.
+               pending
+               (do
+                 (cleanup-boundary! conn state depth rollback release
+                                    :rollback-after-cleanup-failure)
+                 (throw (pending-cleanup-exception
+                          (:cleanup-errors @state))))
+
+               ;; set-rollback! is transaction-wide. Nested boundaries still
+               ;; release normally; the outer boundary performs the rollback.
+               (and (zero? depth) (:rollback? snapshot))
+               (if-let [error (command-error conn rollback)]
+                 (do
+                   (record-cleanup-error! state :rollback-only rollback error true)
+                   (throw error))
+                 ret)
+
+               :else
+               (if-let [completion-error (command-error conn commit)]
+                 (do
+                   ;; A failed COMMIT/RELEASE may leave the database boundary
+                   ;; active. Attempt recovery without re-entering bookkeeping;
+                   ;; the completion exception remains primary.
+                   (cleanup-boundary! conn state depth rollback release
+                                      :rollback-after-completion-failure)
+                   (throw completion-error))
+                 ret))))
+         (finally
+           ;; Exactly one bookkeeping exit follows each successful BEGIN.
+           (swap! state
+                  (fn [s]
+                    (cond-> (update s :depth dec)
+                      (zero? depth) (assoc :rollback? false))))))))))
 
 (defmacro atomic
   "(atomic conn body...) — body runs in a transaction bound to conn."
