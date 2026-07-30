@@ -29,12 +29,12 @@ JDBC `?` placeholders — rewritten to `$N` for postgres).
 
 ## Requirements
 
-`joltc` on PATH; the system `libsqlite3` (preinstalled on macOS and most Linux
+`jolt` on PATH; the system `libsqlite3` (preinstalled on macOS and most Linux
 distros). PostgreSQL support additionally needs `libpq` at runtime.
 
 ## Test
 
 ```bash
-joltc -M:test                              # sqlite
-JOLT_TEST_PG_URI=postgres://... joltc -M:test   # also runs the postgres suite
+jolt -M:test                              # sqlite
+JOLT_TEST_PG_URI=postgres://... jolt -M:test   # also runs the postgres suite
 ```
