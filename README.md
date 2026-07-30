@@ -20,6 +20,13 @@ no JVM: the native binding lives in this library.
 supported on both backends. Queries are strings or sqlvecs (`[sql & params]`,
 JDBC `?` placeholders — rewritten to `$N` for postgres).
 
+On sqlite, an ordinary byte array (`(byte-array ...)`, `bytes?` true) binds as
+a BLOB param, byte-exact and distinct from SQL `NULL` — including a
+zero-length array, which round-trips as a zero-length BLOB rather than `NULL`.
+BLOB columns come back as byte arrays the same way. Any other array or
+sequence type is not treated as a blob; it falls through to sqlite's ordinary
+text/number binding.
+
 ## Layout
 
 - `db.sqlite` / `db.pg` — the native drivers (jolt.ffi bindings).

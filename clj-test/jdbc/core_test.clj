@@ -517,6 +517,151 @@
     (check "successful query finalizes exactly once" 1 @finalize-calls)
     (sqlite/close h)))
 
+(defn check-sqlite-blob! []
+  (println "sqlite BLOB round-trip")
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (jdbc/execute! conn "create table blob_probe (id integer primary key, data blob)")
+
+    (check "insert! returns id for empty blob"
+           1 (jdbc/insert! conn :blob_probe {:id 1 :data (byte-array 0)}))
+    (check "empty blob round-trips as a zero-length array"
+           []
+           (vec (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 1]))))
+    (check "empty blob returns a Jolt byte array"
+           true
+           (bytes?
+            (:data
+             (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 1]))))
+    (check "empty byte array is stored as BLOB, not NULL"
+           "blob"
+           (:storage
+            (jdbc/fetch-one
+             conn
+             ["select typeof(data) as storage from blob_probe where id = ?" 1])))
+
+    (jdbc/insert! conn :blob_probe {:id 2 :data (byte-array [0 1 2 0 255 254 3])})
+    (check "embedded 0 and 0xff round-trip exactly"
+           [0 1 2 0 255 254 3]
+           (vec (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 2]))))
+    (check "non-empty blob returns a Jolt byte array"
+           true
+           (bytes?
+            (:data
+             (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 2]))))
+
+    (let [n 65536
+          payload (byte-array (map #(mod % 256) (range n)))]
+      (jdbc/insert! conn :blob_probe {:id 3 :data payload})
+      (check "large payload round-trips exactly"
+             (vec payload)
+             (vec (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 3])))))
+
+    (jdbc/insert! conn :blob_probe {:id 4 :data nil})
+    (check "SQL NULL round-trips as nil, not an empty array"
+           nil (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 4])))
+    (check "NULL and empty blob remain distinct"
+           false
+           (= (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 4]))
+              (vec (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 1])))))
+
+    (doseq [len [0 1 2 3 5 7 16 31 63 127 255 256 511 1000]]
+      (let [payload (byte-array (map #(mod (+ % len) 256) (range len)))
+            id (+ 100 len)]
+        (jdbc/insert! conn :blob_probe {:id id :data payload})
+        (check (str "deterministic family len=" len " round-trips")
+               (vec payload)
+               (vec (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" id]))))))
+
+    ;; the fetch-one below finalizes its own statement before returning; run
+    ;; more queries afterward and confirm the earlier byte array (copied out
+    ;; by read-blob before finalize) is still intact.
+    (let [returned (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 2]))]
+      (jdbc/fetch conn "select 1")
+      (jdbc/execute! conn "create table blob_probe_scratch (x integer)")
+      (check "blob array remains valid after its statement finalizes"
+             [0 1 2 0 255 254 3]
+             (vec returned)))
+
+    ;; control: an ordinary vector is not a jolt byte array, so it must not be
+    ;; classified as a blob — it falls through to the existing str/TEXT bind.
+    (jdbc/insert! conn :blob_probe {:id 5 :data [1 2 3]})
+    (check "a plain vector is not classified as a blob"
+           (str [1 2 3])
+           (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 5]))))
+
+  (let [h (sqlite/open ":memory:")
+        real-prepare sqlite/sqlite3-prepare
+        real-step sqlite/sqlite3-step
+        real-finalize sqlite/sqlite3-finalize
+        step-calls (atom 0)
+        finalize-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)]
+    (sqlite/query h "create table t (data blob)" [])
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (capturing-prepare real-prepare stmt-ref)
+                    sqlite/sqlite3-bind-blob64
+                    (fn [_stmt _i _p _n _d] 1)
+                    sqlite/sqlite3-step
+                    (fn [stmt] (swap! step-calls inc) (real-step stmt))
+                    sqlite/sqlite3-finalize
+                    (native-destructor-spy real-finalize finalize-calls destroyed?)]
+        (let [err (thrown #(sqlite/query h "insert into t values (?)" [(byte-array [1 2 3])]))]
+          (check "bad blob bind rc is checked and throws" true (some? err))
+          (check "bad blob bind rc prevents step" 0 @step-calls)
+          (check "bad blob bind rc still finalizes exactly once" 1 @finalize-calls)))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (sqlite/close h))
+
+  ;; sqlite3_column_blob returns NULL both for a legitimate zero-length BLOB
+  ;; and for an allocation failure. The driver must consult sqlite3_errcode
+  ;; immediately, before calling sqlite3_column_bytes or any other SQLite API.
+  (let [h (sqlite/open ":memory:")
+        real-prepare sqlite/sqlite3-prepare
+        real-finalize sqlite/sqlite3-finalize
+        finalize-calls (atom 0)
+        bytes-calls (atom 0)
+        errcode-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)]
+    (sqlite/query h "create table t (data blob)" [])
+    (sqlite/query h "insert into t values (?)" [(byte-array [1 2 3])])
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (capturing-prepare real-prepare stmt-ref)
+                    sqlite/sqlite3-column-blob
+                    (fn [_stmt _i] ffi/null)
+                    sqlite/sqlite3-errcode
+                    (fn [_db] (swap! errcode-calls inc) 7)
+                    sqlite/sqlite3-column-bytes
+                    (fn [_stmt _i] (swap! bytes-calls inc) 3)
+                    sqlite/sqlite3-finalize
+                    (native-destructor-spy real-finalize finalize-calls destroyed?)]
+        (let [err (thrown #(sqlite/query h "select data from t" []))]
+          (check "null blob pointer with native error fails closed"
+                 true
+                 (some? err))
+          (check "blob allocation failure retains sqlite rc"
+                 7
+                 (:rc (ex-data err)))
+          (check "blob allocation failure retains column index"
+                 0
+                 (:index (ex-data err)))
+          (check "null blob pointer checks sqlite errcode exactly once"
+                 1
+                 @errcode-calls)
+          (check "null blob pointer checks errcode before column bytes"
+                 0
+                 @bytes-calls)
+          (check "blob read failure finalizes exactly once"
+                 1
+                 @finalize-calls)))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (sqlite/close h)))
+
 (defn -main [& _]
   (println "jdbc.core over sqlite (:memory:)")
   (with-open [conn (jdbc/connection "sqlite::memory:")]
@@ -1093,6 +1238,7 @@
              (:jdbc/transaction-cleanup (ex-data next-error)))))
 
   (check-sqlite-ownership!)
+  (check-sqlite-blob!)
 
   (println "dbspec parsing")
   (check "map spec works" 1
