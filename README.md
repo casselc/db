@@ -45,3 +45,13 @@ distros). PostgreSQL support additionally needs `libpq` at runtime.
 jolt -M:test                              # sqlite
 JOLT_TEST_PG_URI=postgres://... jolt -M:test   # also runs the postgres suite
 ```
+
+The opt-in Hegel property gate exercises SQLite BLOB round-trips with generated
+byte arrays, including exact replay and post-finalize ownership checks. Install
+Hegel's pinned native test support once, then run the property:
+
+```bash
+jolt hegel-setup
+jolt hegel-test
+jolt hegel-test 1969136823635786764      # replay a reported seed
+```
