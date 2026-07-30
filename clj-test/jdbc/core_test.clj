@@ -1,5 +1,7 @@
 (ns jdbc.core-test
-  (:require [jdbc.core :as jdbc]))
+  (:require [jdbc.core :as jdbc]
+            [db.sqlite :as sqlite]
+            [jolt.ffi :as ffi]))
 
 (def failures (atom 0))
 (def checks (atom 0))
@@ -235,6 +237,285 @@
              true (identical? cleanup-error (ex-cause outer-error)))
       (check "rollback-to window outer rollback restores readiness"
              true (transaction-ready? conn)))))
+
+(defn- native-destructor-spy [real-destroy calls destroyed?]
+  (fn [ptr]
+    (swap! calls inc)
+    (if (compare-and-set! destroyed? false true)
+      (real-destroy ptr)
+      ;; Report repeat attempts without passing a retired pointer to SQLite.
+      0)))
+
+(defn- cleanup-native-once! [real-destroy destroyed? ptr]
+  (when (and (some? ptr)
+             (not (ffi/null? ptr))
+             (compare-and-set! destroyed? false true))
+    (real-destroy ptr)))
+
+(defn- capturing-prepare [real-prepare stmt-ref]
+  (fn [db sql n pp tail]
+    (let [rc (real-prepare db sql n pp tail)]
+      (reset! stmt-ref (ffi/read pp :pointer))
+      rc)))
+
+(defn check-sqlite-ownership! []
+  (println "sqlite handle ownership and cleanup")
+
+  (let [h (sqlite/open ":memory:")
+        real-close-v2 sqlite/sqlite3-close-v2
+        close-calls (atom 0)
+        destroyed? (atom false)]
+    (try
+      (with-redefs [sqlite/sqlite3-close-v2
+                    (native-destructor-spy real-close-v2 close-calls destroyed?)]
+        (sqlite/close h)
+        (sqlite/close h))
+      (finally
+        (cleanup-native-once! real-close-v2 destroyed? (:ptr h))))
+    (check "close is idempotent" 1 @close-calls))
+
+  (let [h (sqlite/open ":memory:")]
+    (sqlite/close h)
+    (let [query-error (thrown #(sqlite/query h "select 1" []))
+          changes-error (thrown #(sqlite/changes h))
+          rowid-error (thrown #(sqlite/last-insert-rowid h))]
+      (check "use after close: query rejected" true (:db.sqlite/closed (ex-data query-error)))
+      (check "use after close: changes rejected" true (:db.sqlite/closed (ex-data changes-error)))
+      (check "use after close: last-insert-rowid rejected" true (:db.sqlite/closed (ex-data rowid-error)))
+      (check "closing an already-closed handle does not throw" nil (thrown #(sqlite/close h)))))
+
+  (let [primary (ex-info "sqlite initialization failed" {:kind :primary})
+        cleanup (ex-info "sqlite initialization cleanup failed" {:kind :cleanup})
+        real-open sqlite/open
+        real-close sqlite/close
+        opened (atom nil)
+        close-calls (atom 0)
+        destroyed? (atom false)]
+    (try
+      (with-redefs [sqlite/open
+                    (fn [path]
+                      (let [h (real-open path)]
+                        (reset! opened h)
+                        h))
+                    sqlite/query
+                    (fn [_handle _sql _params] (throw primary))
+                    sqlite/close
+                    (fn [handle]
+                      (swap! close-calls inc)
+                      (when (compare-and-set! destroyed? false true)
+                        (real-close handle))
+                      (throw cleanup))]
+        (let [err (thrown #(jdbc/connection "sqlite::memory:"))]
+          (check "connection initialization preserves its primary throwable"
+                 true
+                 (identical? primary err))))
+      (finally
+        (when-let [handle @opened]
+          (when (compare-and-set! destroyed? false true)
+            (real-close handle)))))
+    (check "connection initialization failure closes its handle exactly once"
+           1
+           @close-calls))
+
+  (let [h (sqlite/open ":memory:")
+        real-close-v2 sqlite/sqlite3-close-v2
+        close-calls (atom 0)]
+    (with-redefs [sqlite/sqlite3-close-v2
+                  (fn [_ptr] (swap! close-calls inc) 21)]
+      (let [err (thrown #(sqlite/close h))]
+        (check "close failure is surfaced" 21 (:rc (ex-data err)))
+        (check "failed close still leaves the handle fail-closed"
+               true
+               (:db.sqlite/closed
+                 (ex-data (thrown #(sqlite/changes h)))))
+        (check "failed close is not retried through an idempotent close"
+               nil
+               (thrown #(sqlite/close h)))))
+    (check "failed close calls close_v2 exactly once" 1 @close-calls)
+    ;; The injected close did not touch SQLite. Retire the raw pointer directly;
+    ;; the logical handle deliberately remains closed.
+    (real-close-v2 (:ptr h)))
+
+  (let [source (sqlite/open ":memory:")
+        db (:ptr source)
+        real-close-v2 sqlite/sqlite3-close-v2
+        close-calls (atom 0)
+        destroyed? (atom false)]
+    ;; Transfer the raw pointer to the forced open-failure path so the original
+    ;; handle cannot close it a second time.
+    (reset! (:closed? source) true)
+    (try
+      (with-redefs [sqlite/sqlite3-open
+                    (fn [_path pp]
+                      (ffi/write pp :pointer 0 db)
+                      14)
+                    sqlite/sqlite3-close-v2
+                    (native-destructor-spy real-close-v2 close-calls destroyed?)]
+        (let [err (thrown #(sqlite/open "forced-open-failure.db"))]
+          (check "open failure with a non-null handle throws" 14 (:rc (ex-data err)))
+          (check "open failure closes the non-null handle exactly once" 1 @close-calls)))
+      (finally
+        (cleanup-native-once! real-close-v2 destroyed? db))))
+
+  (let [h (sqlite/open ":memory:")
+        real-prepare sqlite/sqlite3-prepare
+        real-finalize sqlite/sqlite3-finalize
+        finalize-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)]
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (fn [db sql n pp tail]
+                      (let [rc ((capturing-prepare real-prepare stmt-ref)
+                                db sql n pp tail)]
+                        (if (= 0 rc) 1 rc)))
+                    sqlite/sqlite3-finalize
+                    (native-destructor-spy real-finalize finalize-calls destroyed?)]
+        (let [err (thrown #(sqlite/query h "select ?" [42]))]
+          (check "prepare failure with a non-null statement throws"
+                 1
+                 (:rc (ex-data err)))
+          (check "prepare failure finalizes the non-null statement exactly once"
+                 1
+                 @finalize-calls)))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (sqlite/close h))
+
+  (let [h (sqlite/open ":memory:")
+        real-prepare sqlite/sqlite3-prepare
+        real-finalize sqlite/sqlite3-finalize
+        real-step sqlite/sqlite3-step
+        step-calls (atom 0)
+        finalize-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)]
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (capturing-prepare real-prepare stmt-ref)
+                    sqlite/sqlite3-bind-text
+                    (fn [_stmt _i _v _n _d] 1)
+                    sqlite/sqlite3-step
+                    (fn [stmt] (swap! step-calls inc) (real-step stmt))
+                    sqlite/sqlite3-finalize
+                    (native-destructor-spy real-finalize finalize-calls destroyed?)]
+        (let [err (thrown #(sqlite/query h "select ?" ["x"]))]
+          (check "bad bind rc is checked and throws" true (some? err))
+          (check "bad bind rc prevents step" 0 @step-calls)
+          (check "bad bind rc still finalizes exactly once" 1 @finalize-calls)))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (sqlite/close h))
+
+  (let [h (sqlite/open ":memory:")
+        real-prepare sqlite/sqlite3-prepare
+        real-finalize sqlite/sqlite3-finalize
+        finalize-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)]
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (capturing-prepare real-prepare stmt-ref)
+                    sqlite/sqlite3-bind-int64
+                    (fn [_stmt _i _v] 1)
+                    sqlite/sqlite3-finalize
+                    (native-destructor-spy real-finalize finalize-calls destroyed?)]
+        (let [err (thrown #(sqlite/query h "select ?" [42]))]
+          (check "bind failure throws" true (some? err))
+          (check "bind failure still finalizes the statement" 1 @finalize-calls)))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (sqlite/close h))
+
+  (let [h (sqlite/open ":memory:")
+        real-prepare sqlite/sqlite3-prepare
+        real-finalize sqlite/sqlite3-finalize
+        finalize-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)]
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (capturing-prepare real-prepare stmt-ref)
+                    sqlite/sqlite3-step (fn [_stmt] 1)
+                    sqlite/sqlite3-finalize
+                    (native-destructor-spy real-finalize finalize-calls destroyed?)]
+        (let [err (thrown #(sqlite/query h "select 1" []))]
+          (check "step failure throws" true (some? err))
+          (check "step failure still finalizes the statement" 1 @finalize-calls)))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (sqlite/close h))
+
+  (let [h (sqlite/open ":memory:")
+        real-prepare sqlite/sqlite3-prepare
+        real-finalize sqlite/sqlite3-finalize
+        finalize-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)
+        safe-finalize (native-destructor-spy real-finalize finalize-calls destroyed?)]
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (capturing-prepare real-prepare stmt-ref)
+                    sqlite/sqlite3-finalize
+                    (fn [stmt]
+                      (safe-finalize stmt)
+                      1)]
+        (let [err (thrown #(sqlite/query h "select 1" []))]
+          (check "finalize-only failure throws" true (some? err))
+          (check "finalize-only failure surfaces the finalize rc" 1 (:rc (ex-data err)))
+          (check "finalize-only failure destroys the statement exactly once"
+                 1
+                 @finalize-calls)))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (sqlite/close h))
+
+  (let [h (sqlite/open ":memory:")
+        primary (ex-info "primary bind failure" {:kind :primary})
+        real-prepare sqlite/sqlite3-prepare
+        real-finalize sqlite/sqlite3-finalize
+        finalize-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)
+        safe-finalize (native-destructor-spy real-finalize finalize-calls destroyed?)]
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (capturing-prepare real-prepare stmt-ref)
+                    sqlite/sqlite3-bind-int64
+                    (fn [_stmt _i _v] (throw primary))
+                    sqlite/sqlite3-finalize
+                    (fn [stmt]
+                      (safe-finalize stmt)
+                      1)]
+        (let [err (thrown #(sqlite/query h "select ?" [42]))]
+          (check "finalize failure does not replace the primary query throwable"
+                 true
+                 (identical? primary err))
+          (check "primary failure still finalizes exactly once"
+                 1
+                 @finalize-calls)))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (sqlite/close h))
+
+  (let [h (sqlite/open ":memory:")
+        real-prepare sqlite/sqlite3-prepare
+        real-finalize sqlite/sqlite3-finalize
+        finalize-calls (atom 0)
+        destroyed? (atom false)
+        stmt-ref (atom ffi/null)]
+    (try
+      (with-redefs [sqlite/sqlite3-prepare
+                    (capturing-prepare real-prepare stmt-ref)
+                    sqlite/sqlite3-finalize
+                    (native-destructor-spy real-finalize finalize-calls destroyed?)]
+        (check "ordinary query still returns rows"
+               [{:x 1}]
+               (sqlite/query h "select 1 as x" [])))
+      (finally
+        (cleanup-native-once! real-finalize destroyed? @stmt-ref)))
+    (check "successful query finalizes exactly once" 1 @finalize-calls)
+    (sqlite/close h)))
 
 (defn -main [& _]
   (println "jdbc.core over sqlite (:memory:)")
@@ -810,6 +1091,8 @@
       (check "mixed sqlite next transaction retains cleanup context"
              [{:phase :rollback :sql "ROLLBACK"}]
              (:jdbc/transaction-cleanup (ex-data next-error)))))
+
+  (check-sqlite-ownership!)
 
   (println "dbspec parsing")
   (check "map spec works" 1

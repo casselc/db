@@ -10,6 +10,10 @@
   placeholders — rewritten to $N for postgres). Rows come back as vectors of
   keyword-keyed maps.
 
+  A connection is single-owner and reentrant. Nested operations on that owner
+  are supported, but concurrent operations or close on the same connection are
+  outside the contract.
+
       (require '[jdbc.core :as jdbc])
       (with-open [conn (jdbc/connection \"sqlite::memory:\")]
         (jdbc/execute! conn \"create table p (id integer primary key, name text)\")
@@ -94,17 +98,28 @@
   "Open a connection. spec is a uri string (\"sqlite:path\", a bare sqlite
   path, or \"postgres://user:pass@host:port/db\") or a dbspec map with
   :vendor (or :subprotocol) + :name/:subname [:host :port :user :password].
-  The returned conn map has a :close fn — use with-open."
+  The returned conn map has a :close fn — use with-open. A connection supports
+  one logical owner, including reentrant/nested use; do not overlap operations
+  or close from multiple threads."
   [spec]
   (let [{:keys [vendor] :as spec} (normalize-spec spec)]
     (case vendor
       "sqlite"
       (let [h (sqlite/open (:name spec))]
-        (sqlite/query h "PRAGMA foreign_keys=1;" [])
-        {:vendor   :sqlite
-         :handle   h
-         :tx-state (new-transaction-state)
-         :close    (fn [] (sqlite/close h))})
+        (try
+          (sqlite/query h "PRAGMA foreign_keys=1;" [])
+          {:vendor   :sqlite
+           :handle   h
+           :tx-state (new-transaction-state)
+           :close    (fn [] (sqlite/close h))}
+          (catch Throwable primary
+            ;; No connection owner escapes when initialization fails. Jolt has
+            ;; no suppressed-exception API, so cleanup is attempted without
+            ;; replacing the original initialization throwable.
+            (try
+              (sqlite/close h)
+              (catch Throwable _ nil))
+            (throw primary))))
       "postgresql"
       ;; db.pg (and libpq) load lazily — only when a postgres connection is made,
       ;; so a sqlite-only app never needs libpq present.
