@@ -1,0 +1,86 @@
+P0 sqlite3_get_autocommit binding
+  ok   P0: autocommit after open
+  ok   P0: autocommit inside explicit BEGIN
+  ok   P0: autocommit after COMMIT
+  ok   P0: autocommit after ROLLBACK
+P1 begin-boundary recovery (prove clean or poison)
+P1/C1 begin failure before transition
+  ok   C1: original begin error primary
+  ok   C1: no counter-rollback issued
+  ok   C1: connection ready after proven-clean failure
+  ok   C1: next transaction succeeds
+  ok   C1: physical idle
+P1/C2 begin failure after transition, recovery proves clean
+  ok   C2: original begin error primary
+  ok   C2: exactly one counter-rollback issued
+  ok   C2: connection ready after proven-clean recovery
+  ok   C2: next transaction succeeds
+  ok   C2: physical idle
+P1/C3 counter-rollback failure poisons
+  ok   C3: begin error primary
+  ok   C3: connection poisoned
+  ok   C3: rollback failure recorded
+  ok   C3: subsequent op rejected poisoned
+P1/C4a pre-probe failure poisons before BEGIN
+  ok   C4a: probe error primary
+  ok   C4a: BEGIN never attempted
+  ok   C4a: connection poisoned
+  ok   C4a: pre-probe failure recorded
+P1/C4b post-probe failure poisons after begin failure
+  ok   C4b: begin error primary
+  ok   C4b: connection poisoned
+  ok   C4b: post-probe failure recorded
+P1/C5 pre-existing physical transaction poisons before BEGIN
+  ok   C5: divergence rejected before BEGIN
+  ok   C5: BEGIN never attempted
+  ok   C5: connection poisoned
+  ok   C5: precondition recorded
+  ok   C5: pre-existing transaction left in place
+P1/C6 stale cleanup context cannot mask fresh poison cause
+  ok   C6: seed left resolved connection
+  ok   C6: prior context seeded and retained
+  ok   C6: fresh begin error primary
+  ok   C6: fresh attempt's record replaces retained context
+  ok   C6: poison cause is the fresh rollback error
+P1/control legacy unverified begin remains fail-open (buggy witness)
+  ok   control: legacy path surfaces begin error
+  ok   control: legacy logical state reports ready
+  ok   control: legacy next transaction fails (divergence)
+  ok   control: legacy physical boundary still open
+P2 nested savepoint begin post-success failure
+  ok   P2: nested begin failure caught by user body
+  ok   P2: outer transaction completes
+  ok   P2: logical state ready after outer completion
+  ok   P2: physical idle after outer COMMIT clears savepoint
+  ok   P2: committed row visible
+  note P2: trace [[:attempt "BEGIN"] [:completed "BEGIN"] [:attempt "insert into p2_probe values (1)"] [:completed "insert into p2_probe values (1)"] [:attempt "SAVEPOINT jdbc_sp_1"] [:completed "SAVEPOINT jdbc_sp_1"] [:attempt "COMMIT"] [:completed "COMMIT"]]
+P3 completion trace matrix
+  ok   P3/S1: returns
+  ok   P3/S1: exactly one BEGIN then one COMMIT
+  ok   P3/S1: ready
+  ok   P3/S2: body throwable primary
+  ok   P3/S2: exactly one BEGIN then one ROLLBACK
+  ok   P3/S2: ready
+  ok   P3/S3: returns body value
+  ok   P3/S3: exactly one BEGIN then one ROLLBACK
+  ok   P3/S3: ready
+  ok   P3/S4: returns
+  ok   P3/S4: one completion per boundary
+  ok   P3/S4: ready
+  ok   P3/S5: returns
+  ok   P3/S5: nested rollback-to plus release, single outer commit
+  ok   P3/S5: ready
+  ok   P3/S6: completion throwable primary
+  ok   P3/S6: commit attempt then cleanup rollback
+  ok   P3/S6: ready after successful cleanup rollback
+P4 reentrant depth bookkeeping
+  ok   P4: outer completes after caught nested failure
+  ok   P4: depth samples ascend per boundary
+  ok   P4: depth returns to zero, conn ready
+P5 multi-statement SQL truncation
+  ok   P5: compound create+insert runs without error
+  FAIL P5: rows inserted by the second statement — expected [{:n 1}] got [{:n 0}]
+  ok   P5: insert with trailing select executes silently
+  FAIL P5: trailing select result is dropped, insert applied — expected [{:n 2}] got [{:n 1}]
+Unhandled exception: tx-depth probe failures
+  ex-data: {:n 2, :checks 69}

@@ -54,6 +54,10 @@
 (ffi/defcfn sqlite3-errcode       "sqlite3_errcode"       [:pointer] :int)
 (ffi/defcfn sqlite3-changes       "sqlite3_changes"       [:pointer] :int)
 (ffi/defcfn sqlite3-last-rowid    "sqlite3_last_insert_rowid" [:pointer] :int64)
+;; get-autocommit reads the connection's autocommit flag — a pure in-memory
+;; read (no VFS, no locks), so it stays off the :blocking path like the other
+;; short accessors.
+(ffi/defcfn sqlite3-get-autocommit "sqlite3_get_autocommit" [:pointer] :int)
 
 (def ^:private SQLITE-OK 0)
 (def ^:private SQLITE-NOMEM 7)
@@ -325,3 +329,11 @@
 
 (defn changes [handle] (sqlite3-changes (live-ptr! handle)))
 (defn last-insert-rowid [handle] (sqlite3-last-rowid (live-ptr! handle)))
+
+(defn get-autocommit
+  "Nonzero when `handle` is in autocommit mode (no explicit transaction is
+  open), zero while a transaction is active. Physical ground truth used by
+  jdbc.core's begin-boundary recovery; an in-memory flag read, not a VFS or
+  lock call."
+  [handle]
+  (sqlite3-get-autocommit (live-ptr! handle)))

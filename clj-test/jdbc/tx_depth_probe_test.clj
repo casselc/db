@@ -7,11 +7,15 @@
   failing characterization of that defect. Where a check encodes the current
   contract, it passes and acts as a regression tripwire.
 
-  P1  outer BEGIN reported as failed after the boundary physically opened
+  P0  sqlite3_get_autocommit binding (physical ground truth)
+  P1  begin-boundary recovery contract matrix (prove clean or poison), plus a
+      legacy-path control witness showing the old fail-open divergence
   P2  nested SAVEPOINT reported as failed after the savepoint was created
   P3  completion-path trace matrix (exactly one completion per begun boundary)
   P4  reentrant depth bookkeeping (samples never negative, returns to zero)
   P5  driver-level multi-statement truncation (sqlite3_prepare_v2 pzTail null)
+      — out of this slice's scope; its two checks remain intended tripwire
+      failures, so the suite still exits nonzero with exactly 2 failures.
 
   Run: jolt -A:test -m jdbc.tx-depth-probe-test
   (-M:test -m <this-ns> silently runs the alias's -m jdbc.core-test instead —
@@ -42,6 +46,9 @@
   (= {:depth 0 :rollback? false :pending-cleanup? false :poisoned? false}
      (transaction-state conn)))
 
+(defn poisoned-error? [t]
+  (true? (:jdbc/transaction-poisoned (ex-data t))))
+
 (defn physical-tx-state
   "Non-mutating physical probe: a raw BEGIN either errors (connection is
   physically inside a transaction; error is non-mutating) or succeeds
@@ -53,17 +60,60 @@
       (do (sqlite/query (:handle conn) "ROLLBACK" [])
           {:state :idle}))))
 
-;;; P1 — outer begin: driver reports failure AFTER the boundary opened.
-;;;
-;;; Emulates sqlite3_step/finalize reporting an error for a BEGIN that had
-;;; already transitioned the database. atomic-apply propagates before any
-;;; bookkeeping or cleanup, so the logical and physical states can diverge.
+;;; P0 — sqlite3_get_autocommit binding (physical ground truth).
 
-(defn probe-p1-begin-divergence! []
-  (println "P1 outer begin post-success failure")
+(defn probe-p0-autocommit-binding! []
+  (println "P0 sqlite3_get_autocommit binding")
+  (let [h (sqlite/open ":memory:")]
+    (try
+      (check "P0: autocommit after open" 1 (sqlite/get-autocommit h))
+      (sqlite/query h "BEGIN" [])
+      (check "P0: autocommit inside explicit BEGIN" 0 (sqlite/get-autocommit h))
+      (sqlite/query h "COMMIT" [])
+      (check "P0: autocommit after COMMIT" 1 (sqlite/get-autocommit h))
+      (sqlite/query h "BEGIN" [])
+      (sqlite/query h "ROLLBACK" [])
+      (check "P0: autocommit after ROLLBACK" 1 (sqlite/get-autocommit h))
+      (finally (sqlite/close h)))))
+
+;;; P1 — begin-boundary recovery contract (prove clean or poison).
+;;;
+;;; C1/C2 are the converted original probe-p1-begin-divergence! checks: the
+;;; two properties that failed under the old unverified begin (next
+;;; transaction succeeds; physical idle at logical depth zero) are now
+;;; passing regression checks. C3-C5 cover the fail-closed branches. The
+;;; legacy-path control witness retains the old behavior as a discriminating
+;;; buggy control.
+
+(defn probe-p1-begin-recovery! []
+  (println "P1 begin-boundary recovery (prove clean or poison)")
+  ;; C1: BEGIN reported failed before executing; autocommit proves idle.
+  (println "P1/C1 begin failure before transition")
   (with-open [conn (jdbc/connection "sqlite::memory:")]
     (let [real-execute jdbc/execute!
-          injected (ex-info "simulated post-begin driver failure" {:kind :injected})
+          injected (ex-info "begin reported failed pre-transition" {:kind :injected})
+          events (atom [])
+          caught (with-redefs [jdbc/execute!
+                               (fn [c sql & opts]
+                                 (swap! events conj [:attempt sql])
+                                 (when (= sql "BEGIN") (throw injected))
+                                 (let [ret (apply real-execute c sql opts)]
+                                   (swap! events conj [:completed sql])
+                                   ret))]
+                   (thrown #(jdbc/atomic-apply conn (fn [_] :must-not-run))))]
+      (check "C1: original begin error primary" true (identical? injected caught))
+      (check "C1: no counter-rollback issued" [[:attempt "BEGIN"]] @events)
+      (check "C1: connection ready after proven-clean failure" true (transaction-ready? conn))
+      (check "C1: next transaction succeeds" :recovered
+             (:value (capture #(jdbc/atomic-apply conn (fn [_] :recovered)))))
+      (check "C1: physical idle" :idle (:state (physical-tx-state conn)))))
+  ;; C2: BEGIN physically completed, then reported failed. Counter-rollback
+  ;; plus a final autocommit != 0 observation proves clean — the two checks
+  ;; that FAILed under the old code now pass.
+  (println "P1/C2 begin failure after transition, recovery proves clean")
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (let [real-execute jdbc/execute!
+          injected (ex-info "begin reported failed post-transition" {:kind :injected})
           events (atom [])
           caught (with-redefs [jdbc/execute!
                                (fn [c sql & opts]
@@ -73,27 +123,166 @@
                                    (when (= sql "BEGIN") (throw injected))
                                    ret))]
                    (thrown #(jdbc/atomic-apply conn (fn [_] :must-not-run))))]
-      (check "P1: injected begin failure surfaces" true (identical? injected caught))
-      (check "P1: BEGIN physically completed before the injected throw"
-             [[:attempt "BEGIN"] [:completed "BEGIN"]] @events)
-      (check "P1: logical state reports ready" true (transaction-ready? conn))
-      (let [next-outcome (capture #(jdbc/atomic-apply conn (fn [_] :recovered)))]
-        ;; Safety property: a connection that reports ready must accept a new
-        ;; transaction. A physically open boundary makes the next BEGIN fail.
-        (check "P1: next transaction after begin failure succeeds"
-               :recovered (:value next-outcome)))
-      (let [phys (physical-tx-state conn)]
-        ;; Safety property: logical depth zero implies physical idle.
-        (check "P1: physical boundary idle when logical depth is zero"
-               :idle (:state phys))
-        (when (:error phys)
-          (println "  note P1: next-transaction BEGIN error was"
-                   (ex-message (:error phys)))))
-      ;; P1 left the boundary open if the property failed; restore idle so the
-      ;; remaining probes start clean.
-      (capture #(sqlite/query (:handle conn) "ROLLBACK" []))
-      (check "P1: restored to physical idle for later probes"
-             :idle (:state (physical-tx-state conn))))))
+      (check "C2: original begin error primary" true (identical? injected caught))
+      (check "C2: exactly one counter-rollback issued"
+             [[:attempt "BEGIN"] [:completed "BEGIN"]
+              [:attempt "ROLLBACK"] [:completed "ROLLBACK"]] @events)
+      (check "C2: connection ready after proven-clean recovery" true (transaction-ready? conn))
+      (check "C2: next transaction succeeds" :recovered
+             (:value (capture #(jdbc/atomic-apply conn (fn [_] :recovered)))))
+      (check "C2: physical idle" :idle (:state (physical-tx-state conn)))))
+  ;; C3: counter-rollback fails — cannot prove clean, fail closed.
+  (println "P1/C3 counter-rollback failure poisons")
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (let [real-execute jdbc/execute!
+          begin-error (ex-info "begin post-transition failure" {:kind :begin})
+          rollback-error (ex-info "counter-rollback failed" {:kind :cleanup})
+          caught (with-redefs [jdbc/execute!
+                               (fn [c sql & opts]
+                                 (when (= sql "ROLLBACK") (throw rollback-error))
+                                 (let [ret (apply real-execute c sql opts)]
+                                   (when (= sql "BEGIN") (throw begin-error))
+                                   ret))]
+                   (thrown #(jdbc/atomic-apply conn (fn [_] :must-not-run))))]
+      (check "C3: begin error primary" true (identical? begin-error caught))
+      (check "C3: connection poisoned" true (:poisoned? (transaction-state conn)))
+      (check "C3: rollback failure recorded"
+             [:begin-rollback "ROLLBACK" true]
+             (let [e (first (jdbc/transaction-cleanup-errors conn))]
+               [(:phase e) (:sql e) (identical? rollback-error (:error e))]))
+      (check "C3: subsequent op rejected poisoned" true
+             (poisoned-error? (thrown #(jdbc/fetch conn "select 1"))))
+      ;; Physical transaction is still open; clean up below the API so
+      ;; with-open close is deterministic.
+      (capture #(sqlite/query (:handle conn) "ROLLBACK" []))))
+  ;; C4a: pre-probe unavailable — BEGIN never issued, fail closed.
+  (println "P1/C4a pre-probe failure poisons before BEGIN")
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (let [probe-error (ex-info "autocommit probe unavailable" {:kind :probe})
+          events (atom [])
+          real-execute jdbc/execute!
+          caught (with-redefs [sqlite/get-autocommit (fn [_] (throw probe-error))
+                               jdbc/execute!
+                               (fn [c sql & opts]
+                                 (swap! events conj [:attempt sql])
+                                 (apply real-execute c sql opts))]
+                   (thrown #(jdbc/atomic-apply conn (fn [_] :must-not-run))))]
+      (check "C4a: probe error primary" true (identical? probe-error caught))
+      (check "C4a: BEGIN never attempted" [] @events)
+      (check "C4a: connection poisoned" true (:poisoned? (transaction-state conn)))
+      (check "C4a: pre-probe failure recorded" :begin-pre-probe
+             (:phase (first (jdbc/transaction-cleanup-errors conn))))))
+  ;; C4b: post-probe unavailable after a completed BEGIN — fail closed,
+  ;; begin error stays primary.
+  (println "P1/C4b post-probe failure poisons after begin failure")
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (let [real-ac sqlite/get-autocommit
+          calls (atom 0)
+          probe-error (ex-info "post probe unavailable" {:kind :probe})
+          begin-error (ex-info "begin post-transition failure" {:kind :begin})
+          real-execute jdbc/execute!
+          caught (with-redefs [sqlite/get-autocommit
+                               (fn [h] (if (= 1 (swap! calls inc))
+                                         (real-ac h)
+                                         (throw probe-error)))
+                               jdbc/execute!
+                               (fn [c sql & opts]
+                                 (let [ret (apply real-execute c sql opts)]
+                                   (when (= sql "BEGIN") (throw begin-error))
+                                   ret))]
+                   (thrown #(jdbc/atomic-apply conn (fn [_] :must-not-run))))]
+      (check "C4b: begin error primary" true (identical? begin-error caught))
+      (check "C4b: connection poisoned" true (:poisoned? (transaction-state conn)))
+      (check "C4b: post-probe failure recorded" :begin-post-probe
+             (:phase (first (jdbc/transaction-cleanup-errors conn))))
+      (capture #(sqlite/query (:handle conn) "ROLLBACK" []))))
+  ;; C5: physical transaction already open at logical depth zero (legacy
+  ;; divergence state) — poison before BEGIN, leave the unknown transaction
+  ;; untouched.
+  (println "P1/C5 pre-existing physical transaction poisons before BEGIN")
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (sqlite/query (:handle conn) "BEGIN" [])
+    (let [events (atom [])
+          real-execute jdbc/execute!
+          caught (with-redefs [jdbc/execute!
+                               (fn [c sql & opts]
+                                 (swap! events conj [:attempt sql])
+                                 (apply real-execute c sql opts))]
+                   (thrown #(jdbc/atomic-apply conn (fn [_] :must-not-run))))]
+      (check "C5: divergence rejected before BEGIN" true (poisoned-error? caught))
+      (check "C5: BEGIN never attempted" [] @events)
+      (check "C5: connection poisoned" true (:poisoned? (transaction-state conn)))
+      (check "C5: precondition recorded" :begin-precondition
+             (:phase (first (jdbc/transaction-cleanup-errors conn))))
+      (check "C5: pre-existing transaction left in place" :inside
+             (:state (physical-tx-state conn)))
+      (sqlite/query (:handle conn) "ROLLBACK" [])))
+  ;; C6: retained context from a resolved prior attempt must not mask a
+  ;; fresh poison cause (independent-review scenario).
+  (println "P1/C6 stale cleanup context cannot mask fresh poison cause")
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (let [real-execute jdbc/execute!
+          old-error (ex-info "old release failure" {:kind :old})
+          ;; Seed retained context: nested cleanup (RELEASE) fails once, the
+          ;; encompassing outer rollback succeeds, so the old error is
+          ;; retained with pending/poison clear.
+          seeded-error (with-redefs [jdbc/execute!
+                                     (fn [c sql & opts]
+                                       (if (= sql "RELEASE SAVEPOINT jdbc_sp_1")
+                                         (throw old-error)
+                                         (apply real-execute c sql opts)))]
+                         (thrown
+                           #(jdbc/atomic-apply conn
+                                               (fn [c]
+                                                 (jdbc/atomic-apply c (fn [_] (throw (ex-info "body" {}))))))))
+          seeded (jdbc/transaction-cleanup-errors conn)
+          seeded-ready (transaction-ready? conn)
+          begin-error (ex-info "fresh begin failure" {:kind :begin})
+          rollback-error (ex-info "fresh rollback failure" {:kind :cleanup})
+          caught (with-redefs [jdbc/execute!
+                               (fn [c sql & opts]
+                                 (cond
+                                   (= sql "ROLLBACK") (throw rollback-error)
+                                   (= sql "BEGIN") (let [ret (apply real-execute c sql opts)]
+                                                     (throw begin-error))
+                                   :else (apply real-execute c sql opts)))]
+                   (thrown #(jdbc/atomic-apply conn (fn [_] :must-not-run))))
+          later (thrown #(jdbc/fetch conn "select 1"))]
+      (check "C6: seed left resolved connection" true seeded-ready)
+      (check "C6: prior context seeded and retained"
+             [:release-after-rollback true]
+             [(:phase (first seeded)) (identical? old-error (:error (first seeded)))])
+      (check "C6: fresh begin error primary" true (identical? begin-error caught))
+      (check "C6: fresh attempt's record replaces retained context"
+             [:begin-rollback "ROLLBACK" 1]
+             (let [es (jdbc/transaction-cleanup-errors conn)]
+               [(:phase (first es)) (:sql (first es)) (count es)]))
+      (check "C6: poison cause is the fresh rollback error" true
+             (identical? rollback-error (ex-cause later)))
+      (capture #(sqlite/query (:handle conn) "ROLLBACK" [])))))
+
+(defn probe-p1-control-legacy-path! []
+  (println "P1/control legacy unverified begin remains fail-open (buggy witness)")
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (let [real-execute jdbc/execute!
+          injected (ex-info "begin post-transition failure" {:kind :injected})
+          outcomes (with-redefs [jdbc/verified-sqlite-begin!
+                                 (fn [c _state] (jdbc/execute! c "BEGIN"))
+                                 jdbc/execute!
+                                 (fn [c sql & opts]
+                                   (let [ret (apply real-execute c sql opts)]
+                                     (when (= sql "BEGIN") (throw injected))
+                                     ret))]
+                     {:caught (thrown #(jdbc/atomic-apply conn (fn [_] :must-not-run)))
+                      :ready (transaction-ready? conn)
+                      :next (capture #(jdbc/atomic-apply conn (fn [_] :recovered)))
+                      :physical (:state (physical-tx-state conn))})]
+      (check "control: legacy path surfaces begin error" true (identical? injected (:caught outcomes)))
+      (check "control: legacy logical state reports ready" true (:ready outcomes))
+      (check "control: legacy next transaction fails (divergence)" true
+             (some? (:error (:next outcomes))))
+      (check "control: legacy physical boundary still open" :inside (:physical outcomes))
+      (capture #(sqlite/query (:handle conn) "ROLLBACK" [])))))
 
 ;;; P2 — nested savepoint begin: failure reported AFTER the savepoint exists.
 
@@ -257,7 +446,9 @@
       (finally (sqlite/close h)))))
 
 (defn -main [& _]
-  (probe-p1-begin-divergence!)
+  (probe-p0-autocommit-binding!)
+  (probe-p1-begin-recovery!)
+  (probe-p1-control-legacy-path!)
   (probe-p2-nested-begin-divergence!)
   (probe-p3-trace-matrix!)
   (probe-p4-depth-bookkeeping!)
