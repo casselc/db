@@ -252,9 +252,10 @@
 (defn transaction-cleanup-errors
   "Cleanup failures retained from the most recent outer transaction attempt.
   Each entry contains :phase, :sql, and the original :error. A new outer
-  transaction clears the entries after BEGIN succeeds. If an outer cleanup
-  failure leaves the connection poisoned, this accessor and :close remain
-  usable but query and transaction operations fail closed."
+  transaction clears the entries (on the sqlite verified-begin path, before
+  BEGIN is issued; on the other paths, after BEGIN succeeds). If an outer
+  cleanup failure leaves the connection poisoned, this accessor and :close
+  remain usable but query and transaction operations fail closed."
   [conn]
   (:cleanup-errors @(:tx-state conn)))
 
@@ -310,6 +311,81 @@
              {:jdbc/transaction-cleanup (cleanup-context errors)}
              (:error first-error))))
 
+(defn- verified-sqlite-begin!
+  "Depth-0 BEGIN for the sqlite vendor with physical-state verification,
+  implementing the prove-clean-or-poison contract in
+  docs/findings/begin-boundary-recovery-contract.md. Reuse is safe only
+  after a final sqlite3_get_autocommit != 0 observation. Throws the original
+  begin error as primary whenever one exists; poisons the connection
+  whenever physical state cannot be proven clean; never issues a
+  counter-rollback into a transaction it cannot prove this BEGIN opened."
+  [conn state]
+  ;; A new outer attempt discards retained context from prior attempts up
+  ;; front (the unverified paths clear only after a successful BEGIN), so
+  ;; anything recorded during this begin — including a poison cause — is
+  ;; always fresh, never a stale error from a resolved attempt.
+  (swap! state assoc :cleanup-errors [])
+  (let [handle (:handle conn)
+        probe (fn [] (try {:ac (sqlite/get-autocommit handle)}
+                          (catch Throwable t {:error t})))
+        pre (probe)]
+    (if-let [pre-error (:error pre)]
+      ;; R7: nothing about the physical boundary can be proven.
+      (do
+        (record-cleanup-error! state :begin-pre-probe "sqlite3_get_autocommit" pre-error true)
+        (throw pre-error))
+      (if (zero? (:ac pre))
+        ;; R6: physical transaction open while logical depth is zero. The
+        ;; pre-existing transaction holds unknown work; leave it untouched
+        ;; and fail closed rather than issue a doomed BEGIN.
+        (let [divergence (ex-info "connection is physically inside a transaction while logical depth is zero; close connection"
+                                  {:jdbc/transaction-poisoned true
+                                   :jdbc/close-required true})]
+          (record-cleanup-error! state :begin-precondition "BEGIN" divergence true)
+          (throw divergence))
+        (let [begin-outcome (try {:value (execute! conn "BEGIN")}
+                                 (catch Throwable t {:error t}))]
+          (when-let [begin-error (:error begin-outcome)]
+            (let [post (probe)]
+              (cond
+                ;; R5: begin failed and the post-probe is unavailable.
+                (:error post)
+                (do
+                  (record-cleanup-error! state :begin-post-probe "sqlite3_get_autocommit" (:error post) true)
+                  (throw begin-error))
+
+                ;; R1: BEGIN never took effect — proven clean by ac != 0.
+                (not (zero? (:ac post)))
+                (throw begin-error)
+
+                ;; Our BEGIN half-opened an empty transaction; the
+                ;; counter-rollback is only an attempt — reuse requires a
+                ;; final ac != 0 observation.
+                :else
+                (if-let [rollback-error (command-error conn "ROLLBACK")]
+                  ;; R4: counter-rollback failed.
+                  (do
+                    (record-cleanup-error! state :begin-rollback "ROLLBACK" rollback-error true)
+                    (throw begin-error))
+                  (let [verify (probe)]
+                    (cond
+                      (:error verify)
+                      (do
+                        (record-cleanup-error! state :begin-rollback-verify "sqlite3_get_autocommit" (:error verify) true)
+                        (throw begin-error))
+
+                      ;; R2: proven clean by final ac != 0.
+                      (not (zero? (:ac verify)))
+                      (throw begin-error)
+
+                      ;; R3: rollback reported success but the boundary is
+                      ;; still open — cannot prove clean.
+                      :else
+                      (let [still-open (ex-info "transaction boundary still open after counter-rollback"
+                                                {:jdbc/begin-recovery true})]
+                        (record-cleanup-error! state :begin-rollback-verify "sqlite3_get_autocommit" still-open true)
+                        (throw begin-error)))))))))))))
+
 (defn atomic-apply
   "Run (func conn) in a transaction; nested calls use savepoints.
 
@@ -325,7 +401,12 @@
          commit (if (zero? depth) "COMMIT" (str "RELEASE SAVEPOINT " sp))
          rollback (if (zero? depth) "ROLLBACK" (str "ROLLBACK TO SAVEPOINT " sp))
          release (str "RELEASE SAVEPOINT " sp)]
-     (execute! conn begin)
+      (if (and (zero? depth) (= :sqlite (:vendor conn)))
+        ;; Verified begin: a BEGIN that reports failure is reconciled against
+        ;; sqlite3_get_autocommit (prove clean or poison), so logical depth
+        ;; zero never reports ready while a physical transaction may be open.
+        (verified-sqlite-begin! conn state)
+        (execute! conn begin))
      (swap! state
             (fn [s]
               (cond-> (assoc s :depth (inc (:depth s)))

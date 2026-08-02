@@ -1,0 +1,211 @@
+jdbc.core over sqlite (:memory:)
+  ok   execute! ddl
+  ok   insert! returns the id
+  ok   insert-multi! ids
+  ok   fetch sqlvec with params
+  ok   fetch-one
+  ok   fetch plain string
+  ok   update! rows affected
+  ok   update applied
+  ok   delete! rows affected
+transactions
+  ok   atomic commits
+  ok   atomic rolls back on throw
+  ok   rollback discarded the insert
+  ok   nested savepoint: outer survives
+  ok   nested savepoint: inner rolled back
+  ok   set-rollback! discards the block
+transaction failure paths
+  ok   begin failure remains primary
+  ok   begin failure issues no cleanup
+  ok   begin failure skips the body
+  ok   begin failure leaves connection ready
+  ok   nested success returns outer result
+  ok   nested success command order
+  ok   nested success leaves connection ready
+  ok   nested set-rollback returns outer result
+  ok   nested set-rollback is transaction-wide
+  ok   nested set-rollback leaves connection ready
+  ok   commit failure remains primary
+  ok   commit failure attempts one recovery rollback
+  ok   commit failure leaves transaction idle
+  ok   successful recovery adds no cleanup error
+  ok   after commit failure: next transaction returns
+  ok   after commit failure: next transaction completes
+  ok   after commit failure: connection remains ready
+  ok   after commit failure: prior cleanup context clears
+  ok   commit failure remains primary when recovery fails
+  ok   failed commit recovery command order
+  ok   failed commit recovery poisons the connection
+  ok   failed commit recovery context
+  ok   after failed commit recovery: fails closed
+  ok   after failed commit recovery: requires close
+  ok   after failed commit recovery: retains cleanup cause
+  ok   rollback-only failure remains primary
+  ok   rollback-only failure is not attempted twice
+  ok   rollback-only failure poisons the connection
+  ok   rollback-only cleanup context
+  ok   poisoned fetch: fails closed
+  ok   poisoned fetch: requires close
+  ok   poisoned fetch: retains cleanup cause
+  ok   poisoned execute: fails closed
+  ok   poisoned execute: requires close
+  ok   poisoned execute: retains cleanup cause
+  ok   poisoned last-id: fails closed
+  ok   poisoned last-id: requires close
+  ok   poisoned last-id: retains cleanup cause
+  ok   poisoned transaction: fails closed
+  ok   poisoned transaction: requires close
+  ok   poisoned transaction: retains cleanup cause
+  ok   body exception identity survives cleanup failure
+  ok   body exception data survives cleanup failure
+  ok   body cleanup failure is attempted once
+  ok   body cleanup failure poisons the connection
+  ok   body cleanup failure context is retained
+  ok   after body cleanup failure: fails closed
+  ok   after body cleanup failure: requires close
+  ok   after body cleanup failure: retains cleanup cause
+  ok   nested rollback lets outer body continue
+  ok   nested rollback releases its savepoint
+  ok   nested rollback leaves transaction idle
+  ok   nested completion failure remains primary
+  ok   nested completion recovery lets outer continue
+  ok   nested completion recovery command order
+  ok   successful nested completion recovery adds no context
+  ok   successful nested completion recovery leaves connection ready
+  ok   failed nested recovery preserves completion error at inner boundary
+  ok   caught failed nested recovery becomes cleanup exception
+  ok   caught failed nested recovery retains cleanup cause
+  ok   caught failed nested recovery context
+  ok   caught failed nested recovery command order
+  ok   caught failed nested recovery context is retained
+  ok   successful encompassing rollback clears poison
+  ok   after failed nested recovery: next transaction returns
+  ok   after failed nested recovery: next transaction completes
+  ok   after failed nested recovery: connection remains ready
+  ok   after failed nested recovery: prior cleanup context clears
+  ok   nested body exception survives release cleanup failure
+  ok   nested cleanup failure rolls back the outer transaction
+  ok   nested cleanup failure leaves transaction idle
+  ok   nested release cleanup context is retained
+  ok   after nested cleanup failure: next transaction returns
+  ok   after nested cleanup failure: next transaction completes
+  ok   after nested cleanup failure: connection remains ready
+  ok   after nested cleanup failure: prior cleanup context clears
+  ok   caught nested body cannot hide cleanup failure
+  ok   caught nested cleanup failure retains cleanup cause
+  ok   caught nested cleanup failure exposes exact context
+  ok   caught nested cleanup failure is fail-closed
+  ok   caught nested cleanup failure leaves transaction idle
+  ok   after caught nested cleanup failure: next transaction returns
+  ok   after caught nested cleanup failure: next transaction completes
+  ok   after caught nested cleanup failure: connection remains ready
+  ok   after caught nested cleanup failure: prior cleanup context clears
+  ok   multiple cleanup failures retain first cause
+  ok   multiple cleanup failure exception context is ordered
+  ok   multiple cleanup failure command order
+  ok   failed encompassing rollback poisons connection
+  ok   multiple cleanup errors retain throwable order
+  ok   after failed encompassing rollback: fails closed
+  ok   after failed encompassing rollback: requires close
+  ok   after failed encompassing rollback: retains cleanup cause
+mixed real-sqlite nested cleanup window
+  ok   pending window preserves inner body throwable
+  ok   pending window is explicit before outer recovery
+  ok   pending window retains cleanup context
+  ok   pending window blocks fetch
+  ok   pending window blocks execute
+  ok   pending window blocks last-id
+  ok   pending window blocks set-rollback
+  ok   pending window blocks atomic
+  ok   pending window blocks later atomic body
+  ok   pending window reaches only internal outer rollback
+  ok   pending window outer error reports cleanup
+  ok   pending window outer error retains cleanup cause
+  ok   pending window outer rollback restores readiness
+  ok   pending window outer rollback removes real rows
+nested rollback-to cleanup window
+  ok   rollback-to window preserves completion throwable
+  ok   rollback-to window is explicit before outer recovery
+  ok   rollback-to window blocks fetch
+  ok   rollback-to window retains cleanup cause
+  ok   rollback-to window reaches encompassing rollback
+  ok   rollback-to window outer error retains cleanup cause
+  ok   rollback-to window outer rollback restores readiness
+mixed real-sqlite cleanup failure
+  ok   mixed sqlite failure preserves body throwable
+  ok   mixed sqlite failure reached real begin and body SQL only
+  ok   mixed sqlite failure poisons logical state
+  ok   mixed sqlite cleanup context
+  ok   mixed sqlite ordinary query is rejected
+  ok   mixed sqlite query retains cleanup cause
+  ok   mixed sqlite next transaction is rejected before BEGIN
+  ok   mixed sqlite next transaction retains cleanup context
+sqlite handle ownership and cleanup
+  ok   close is idempotent
+  ok   use after close: query rejected
+  ok   use after close: changes rejected
+  ok   use after close: last-insert-rowid rejected
+  ok   closing an already-closed handle does not throw
+  ok   connection initialization preserves its primary throwable
+  ok   connection initialization failure closes its handle exactly once
+  ok   close failure is surfaced
+  ok   failed close still leaves the handle fail-closed
+  ok   failed close is not retried through an idempotent close
+  ok   failed close calls close_v2 exactly once
+  ok   open failure with a non-null handle throws
+  ok   open failure closes the non-null handle exactly once
+  ok   prepare failure with a non-null statement throws
+  ok   prepare failure finalizes the non-null statement exactly once
+  ok   bad bind rc is checked and throws
+  ok   bad bind rc prevents step
+  ok   bad bind rc still finalizes exactly once
+  ok   bind failure throws
+  ok   bind failure still finalizes the statement
+  ok   step failure throws
+  ok   step failure still finalizes the statement
+  ok   finalize-only failure throws
+  ok   finalize-only failure surfaces the finalize rc
+  ok   finalize-only failure destroys the statement exactly once
+  ok   finalize failure does not replace the primary query throwable
+  ok   primary failure still finalizes exactly once
+  ok   ordinary query still returns rows
+  ok   successful query finalizes exactly once
+sqlite BLOB round-trip
+  ok   insert! returns id for empty blob
+  ok   empty blob round-trips as a zero-length array
+  ok   empty blob returns a Jolt byte array
+  ok   empty byte array is stored as BLOB, not NULL
+  ok   embedded 0 and 0xff round-trip exactly
+  ok   non-empty blob returns a Jolt byte array
+  ok   large payload round-trips exactly
+  ok   SQL NULL round-trips as nil, not an empty array
+  ok   NULL and empty blob remain distinct
+  ok   deterministic family len=0 round-trips
+  ok   deterministic family len=1 round-trips
+  ok   deterministic family len=2 round-trips
+  ok   deterministic family len=3 round-trips
+  ok   deterministic family len=5 round-trips
+  ok   deterministic family len=7 round-trips
+  ok   deterministic family len=16 round-trips
+  ok   deterministic family len=31 round-trips
+  ok   deterministic family len=63 round-trips
+  ok   deterministic family len=127 round-trips
+  ok   deterministic family len=255 round-trips
+  ok   deterministic family len=256 round-trips
+  ok   deterministic family len=511 round-trips
+  ok   deterministic family len=1000 round-trips
+  ok   blob array remains valid after its statement finalizes
+  ok   a plain vector is not classified as a blob
+  ok   bad blob bind rc is checked and throws
+  ok   bad blob bind rc prevents step
+  ok   bad blob bind rc still finalizes exactly once
+  ok   null blob pointer with native error fails closed
+  ok   blob allocation failure retains sqlite rc
+  ok   blob allocation failure retains column index
+  ok   null blob pointer checks sqlite errcode exactly once
+  ok   null blob pointer checks errcode before column bytes
+  ok   blob read failure finalizes exactly once
+dbspec parsing
+  ok   map spec works
+all 201 checks passed
