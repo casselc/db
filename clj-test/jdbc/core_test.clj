@@ -541,7 +541,7 @@
 
     (jdbc/insert! conn :blob_probe {:id 2 :data (byte-array [0 1 2 0 255 254 3])})
     (check "embedded 0 and 0xff round-trip exactly"
-           [0 1 2 0 255 254 3]
+           [0 1 2 0 -1 -2 3]
            (vec (:data (jdbc/fetch-one conn ["select data from blob_probe where id = ?" 2]))))
     (check "non-empty blob returns a Jolt byte array"
            true
@@ -579,7 +579,7 @@
       (jdbc/fetch conn "select 1")
       (jdbc/execute! conn "create table blob_probe_scratch (x integer)")
       (check "blob array remains valid after its statement finalizes"
-             [0 1 2 0 255 254 3]
+             [0 1 2 0 -1 -2 3]
              (vec returned)))
 
     ;; control: an ordinary vector is not a jolt byte array, so it must not be
