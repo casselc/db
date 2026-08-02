@@ -55,12 +55,17 @@ recommendations below are written for released v0.5.17 with a forward note.
   `sqlite3_bind_blob64` with `SQLITE_TRANSIENT` → immediate free) is
   byte-exact and ownership-sound, including the zero-length-vs-NULL
   distinction (runtime: generated blob properties in the 201/201 suite).
-  Perf note (`table`): `ffi/write-array` is an element-wise loop at v0.5.17;
-  the post-release ranged-transfer work is the bulk-copy path. Forward note:
-  post-release scoped byte-array loans could pass the array's pointer
-  directly to `bind_blob64` (safe with `SQLITE_TRANSIENT`, which copies
-  synchronously before return), eliminating the intermediate buffer — adopt
-  only when a release contains the loan API.
+  Perf note (`table`): `ffi/write-array` is an element-wise loop at v0.5.17.
+  Forward note, corrected after independent review: the post-release features
+  do **not** provide a bulk or zero-copy path. `dc6d3637`'s ranged transfers
+  (`read-array!`, four-arg `write-array`) remain per-byte Scheme loops, and
+  `f06f77f0`'s `with-byte-array-pointer` is explicitly a copy-in/copy-back
+  bridge: it lends a pointer to a private native-octet *snapshot* of the
+  array and copies back on scope exit. Adopting it in `bind-blob!` would
+  replace the current explicit alloc/copy/free with an equivalent copy-in
+  plus a wasted copy-back (the bind is input-only), so it can regress
+  performance; any future migration requires a benchmark, and none is
+  recommended now.
 - `read-blob`'s null-pointer → immediate `sqlite3_errcode` check remains
   **necessary and must not be "modernized"**: the post-release atomic
   native-error capture targets Chez `errno`; SQLite does not report BLOB
@@ -82,11 +87,21 @@ recommendations below are written for released v0.5.17 with a forward note.
   correctly stay nonblocking.
 - **Addition candidates** (all v0.5.17-compatible, plain `defcfn`s):
   `sqlite3_get_autocommit` (begin-failure recovery, above);
-  `sqlite3_busy_timeout` (bound lock-wait behavior for contended file DBs —
-  currently a contended `sqlite3_step` parks collect-safe with no timeout);
+  `sqlite3_busy_timeout` (opt-in bounded sleep/retry under lock contention —
+  corrected after independent review: the driver installs no busy handler,
+  so SQLite's default NULL handler makes a contended `sqlite3_step` return
+  `SQLITE_BUSY` **immediately**, not park; runtime probe below. The knob
+  *adds* a bounded wait policy where there is currently instant failure —
+  it does not cap an existing unbounded wait);
   `sqlite3_extended_errcode` (richer failure classification for the
   transaction poison paths). None are blocking-FFI *defects*; they close
   observability/behavior gaps.
+
+Contention probe (`runtime`, released v0.5.17 launcher, x86_64-linux): two
+handles on one file database, `BEGIN IMMEDIATE` on the first, then an
+`INSERT` on the second returned `{:err "sqlite step failed: database is
+locked", :rc 5}` in 0 ms — `SQLITE_BUSY` is immediate, confirming no busy
+handler is installed.
 
 ## Nonclaims
 

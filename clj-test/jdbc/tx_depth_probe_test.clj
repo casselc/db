@@ -13,7 +13,9 @@
   P4  reentrant depth bookkeeping (samples never negative, returns to zero)
   P5  driver-level multi-statement truncation (sqlite3_prepare_v2 pzTail null)
 
-  Run: jolt -M:test -m jdbc.tx-depth-probe-test"
+  Run: jolt -A:test -m jdbc.tx-depth-probe-test
+  (-M:test -m <this-ns> silently runs the alias's -m jdbc.core-test instead —
+  the baseline suite — because the alias :main-opts consume trailing args.)"
   (:require [jdbc.core :as jdbc]
             [db.sqlite :as sqlite]))
 

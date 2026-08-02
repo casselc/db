@@ -1,0 +1,45 @@
+P1 outer begin post-success failure
+  ok   P1: injected begin failure surfaces
+  ok   P1: BEGIN physically completed before the injected throw
+  ok   P1: logical state reports ready
+  FAIL P1: next transaction after begin failure succeeds — expected :recovered got nil
+  FAIL P1: physical boundary idle when logical depth is zero — expected :idle got :inside
+  note P1: next-transaction BEGIN error was sqlite step failed: cannot start a transaction within a transaction
+  ok   P1: restored to physical idle for later probes
+P2 nested savepoint begin post-success failure
+  ok   P2: nested begin failure caught by user body
+  ok   P2: outer transaction completes
+  ok   P2: logical state ready after outer completion
+  ok   P2: physical idle after outer COMMIT clears savepoint
+  ok   P2: committed row visible
+  note P2: trace [[:attempt "BEGIN"] [:completed "BEGIN"] [:attempt "insert into p2_probe values (1)"] [:completed "insert into p2_probe values (1)"] [:attempt "SAVEPOINT jdbc_sp_1"] [:completed "SAVEPOINT jdbc_sp_1"] [:attempt "COMMIT"] [:completed "COMMIT"]]
+P3 completion trace matrix
+  ok   P3/S1: returns
+  ok   P3/S1: exactly one BEGIN then one COMMIT
+  ok   P3/S1: ready
+  ok   P3/S2: body throwable primary
+  ok   P3/S2: exactly one BEGIN then one ROLLBACK
+  ok   P3/S2: ready
+  ok   P3/S3: returns body value
+  ok   P3/S3: exactly one BEGIN then one ROLLBACK
+  ok   P3/S3: ready
+  ok   P3/S4: returns
+  ok   P3/S4: one completion per boundary
+  ok   P3/S4: ready
+  ok   P3/S5: returns
+  ok   P3/S5: nested rollback-to plus release, single outer commit
+  ok   P3/S5: ready
+  ok   P3/S6: completion throwable primary
+  ok   P3/S6: commit attempt then cleanup rollback
+  ok   P3/S6: ready after successful cleanup rollback
+P4 reentrant depth bookkeeping
+  ok   P4: outer completes after caught nested failure
+  ok   P4: depth samples ascend per boundary
+  ok   P4: depth returns to zero, conn ready
+P5 multi-statement SQL truncation
+  ok   P5: compound create+insert runs without error
+  FAIL P5: rows inserted by the second statement — expected [{:n 1}] got [{:n 0}]
+  ok   P5: insert with trailing select executes silently
+  FAIL P5: trailing select result is dropped, insert applied — expected [{:n 2}] got [{:n 1}]
+Unhandled exception: tx-depth probe failures
+  ex-data: {:n 4, :checks 36}
