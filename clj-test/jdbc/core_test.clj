@@ -24,6 +24,24 @@
            (jdbc/fetch-one conn ["select * from person where zip = ?" 10001]))
     (check "fetch plain string" 3
            (count (jdbc/fetch conn "select * from person")))
+    (check "SQL errors catch java.sql.SQLException" :caught
+           (try
+             (jdbc/fetch conn "select * from missing_table")
+             (catch java.sql.SQLException _ :caught)))
+    (check "SQL errors still catch Exception" :caught
+           (try
+             (jdbc/fetch conn "select * from missing_table")
+             (catch Exception _ :caught)))
+    (jdbc/execute! conn "create table payload (id integer primary key, content blob not null)")
+    (doseq [[label payload] [["embedded NULs" (byte-array [65 0 66 0 67])]
+                             ["non-UTF-8 bytes" (byte-array [-1 -2])]
+                             ["empty payload" (byte-array [])]]]
+      (let [id (jdbc/insert! conn :payload {:content payload})
+            actual (:content
+                    (jdbc/fetch-one conn
+                                    ["select content from payload where id = ?" id]))]
+        (check (str "BLOB " label " returns bytes") true (bytes? actual))
+        (check (str "BLOB " label " round-trips") (vec payload) (vec actual))))
     (check "update! rows affected" 2
            (jdbc/update! conn :person {:zip 94540} ["zip = ?" 94546]))
     (check "update applied" 2
