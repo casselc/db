@@ -8,7 +8,7 @@
  ;; jdbc.util/lower-case calls (Locale/US), which that library provides rather
  ;; than jolt core (RFC 0008), and it sits in the path of every insert.
  :deps {io.github.yogthos/clojure.jdbc {:git/url "https://github.com/yogthos/clojure.jdbc.git"
-                                        :git/sha "7b19a2caaa59bf73e083b8ba1943a770a58c4c07"}
+                                        :git/sha "9fc25d66492164ce204960d6d7b1531e194e2193"}
         io.github.jolt-lang/time {:git/url "https://github.com/jolt-lang/time.git"
                                   :git/sha "70dfb7981ef4ed70c5d142109d56a90edfb79cef"}}
 
