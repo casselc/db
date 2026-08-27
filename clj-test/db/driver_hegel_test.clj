@@ -34,7 +34,9 @@
       (let [params (vec params)]
         (swap! calls conj [:execute sql params])
         (if (str/starts-with? (str/lower-case sql) "select")
-          {:labels (mapv #(str "p" %) (range (count params)))
+          {:labels (if (seq params)
+                     (mapv #(str "p" %) (range (count params)))
+                     ["p0"])
            :rows (if (seq params) [params] [[42]])
            :count 0}
           {:labels [] :rows [] :count 1})))))

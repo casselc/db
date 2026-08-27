@@ -66,8 +66,13 @@
 (defn- sql-error
   "Throw as java.sql.SQLException by class, so a caller's (catch SQLException ...)
   matches on the class rather than on anything we put in ex-data."
-  [msg]
-  (throw (jolt.host/throwable "java.sql.SQLException" (str msg))))
+  ([msg]
+   (throw (jolt.host/throwable "java.sql.SQLException" (str msg))))
+  ([msg cause]
+   ;; Modeled SQLExceptions do not themselves carry ex-data, but preserving the
+   ;; original exception as their cause keeps precise driver/boundary data
+   ;; available through (ex-data (ex-cause e)).
+   (throw (jolt.host/throwable "java.sql.SQLException" (str msg) cause))))
 
 (defn- unsupported [msg]
   (throw (jolt.host/throwable "java.sql.SQLFeatureNotSupportedException" (str msg))))
@@ -77,7 +82,7 @@
 ;; the class they expect.
 (defn- as-sql-error [e]
   (if (:jdbc/sql-error (ex-data e))
-    (sql-error (ex-message e))
+    (sql-error (ex-message e) e)
     (throw e)))
 
 (defmacro ^:private sql-try [& body]
@@ -88,10 +93,53 @@
 (defn- descriptor-of [conn] (tget conn :descriptor))
 (defn- handle [conn] (tget conn :handle))
 
+(defn- invalid-result! [conn message data]
+  (throw (ex-info message
+                  (merge {:jdbc/sql-error true
+                          :db.driver/error :invalid-result
+                          :driver-id (:id (descriptor-of conn))}
+                         data))))
+
+(defn- validate-result
+  "Fail at the external-driver boundary instead of letting zipmap/nth silently
+  truncate a malformed eager positional result."
+  [conn result]
+  (when-not (map? result)
+    (invalid-result! conn "driver result must be a map"
+                     {:field :result :actual-type (str (class result))}))
+  (let [{:keys [labels rows count]} result]
+    (when-not (vector? labels)
+      (invalid-result! conn "driver result :labels must be a vector"
+                       {:field :labels :actual-type (str (class labels))}))
+    (doseq [[index label] (map-indexed vector labels)]
+      (when-not (string? label)
+        (invalid-result! conn "driver result labels must be strings"
+                         {:field :labels :label-index index
+                          :actual-type (str (class label))})))
+    (when-not (vector? rows)
+      (invalid-result! conn "driver result :rows must be a vector"
+                       {:field :rows :actual-type (str (class rows))}))
+    (doseq [[index row] (map-indexed vector rows)]
+      (when-not (vector? row)
+        (invalid-result! conn "driver result rows must be vectors"
+                         {:field :rows :row-index index
+                          :actual-type (str (class row))}))
+      (when-not (= (clojure.core/count labels) (clojure.core/count row))
+        (invalid-result! conn "driver result row width does not match labels"
+                         {:field :rows :row-index index
+                          :expected-width (clojure.core/count labels)
+                          :actual-width (clojure.core/count row)})))
+    (when-not (and (integer? count) (not (neg? count)))
+      (invalid-result! conn "driver result :count must be a nonnegative integer"
+                       {:field :count :actual count}))
+    result))
+
 (defn- run-any [conn sql params]
   (when (tget conn :closed)
     (sql-error "connection is closed"))
-  (sql-try (driver/execute-handle (driver-of conn) (handle conn) sql params)))
+  (sql-try
+    (validate-result conn
+                     (driver/execute-handle (driver-of conn) (handle conn) sql params))))
 
 (defn- run-query
   "Execute `sql` and return {:labels [...] :rows [[v ...]]}."

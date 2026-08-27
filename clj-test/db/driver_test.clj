@@ -190,4 +190,56 @@
           (check "flat nested body was not run" false @nested-ran)))
       (finally (driver/unregister! :tx-flat))))
 
+  (println "driver result boundary validation")
+  (let [result (atom {:labels [] :rows [] :count 0})
+        malformed
+        (reify driver/Driver
+          (descriptor [_]
+            (descriptor :malformed #{"malformed"} ["malformed:"]
+                        :none :none "Malformed"))
+          (open-handle [_ _] result)
+          (close-handle [_ _] nil)
+          (execute-handle [_ handle _ _] @handle))
+        caught (fn [conn value]
+                 (reset! result value)
+                 (try
+                   (jdbc/fetch conn "select 1")
+                   nil
+                   (catch Throwable t t)))
+        error-data (fn [error] (some-> error ex-cause ex-data))]
+    (try
+      (driver/register! malformed)
+      (with-open [conn (jdbc/connection "malformed:value")]
+        (let [error (caught conn {:labels '("a") :rows [[1]] :count 0})]
+          (check "non-vector labels fail as SQLException" true
+                 (instance? java.sql.SQLException error))
+          (check "label shape error retains precise cause data"
+                 {:jdbc/sql-error true :db.driver/error :invalid-result
+                  :driver-id :malformed :field :labels}
+                 (select-keys (error-data error)
+                              [:jdbc/sql-error :db.driver/error :driver-id :field])))
+        (let [error (caught conn {:labels ["a" 2] :rows [[1 2]] :count 0})]
+          (check "non-string label reports its index"
+                 {:field :labels :label-index 1}
+                 (select-keys (error-data error) [:field :label-index])))
+        (let [error (caught conn {:labels ["a" "b"] :rows [[1]] :count 0})]
+          (check "row width mismatch reports expected and actual widths"
+                 {:field :rows :row-index 0 :expected-width 2 :actual-width 1}
+                 (select-keys (error-data error)
+                              [:field :row-index :expected-width :actual-width])))
+        (let [error (caught conn {:labels ["a"] :rows ['(1)] :count 0})]
+          (check "non-vector positional row is rejected"
+                 {:field :rows :row-index 0}
+                 (select-keys (error-data error) [:field :row-index])))
+        (let [error (caught conn {:labels [] :rows [] :count 1.5})]
+          (check "non-integer update count is rejected"
+                 {:field :count :actual 1.5}
+                 (select-keys (error-data error) [:field :actual])))
+        (let [error (caught conn {:labels [] :rows [] :count -1})]
+          (check "negative update count is rejected"
+                 {:field :count :actual -1}
+                 (select-keys (error-data error) [:field :actual]))))
+      (finally
+        (driver/unregister! :malformed))))
+
   (sqlite-ownership-checks check))

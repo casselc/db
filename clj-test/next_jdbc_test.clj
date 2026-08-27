@@ -5,7 +5,8 @@
   (:require [jdbc.core :as jc]
             [next.jdbc :as nj]
             [next.jdbc.sql :as sql]
-            [db.datasource :as ds]))
+            [db.datasource :as ds]
+            [db.driver :as driver]))
 
 (defn run [check]
   (println "next.jdbc surface over sqlite (:memory:)")
@@ -86,6 +87,48 @@
       (check "acquire after close-datasource throws" :closed
              (try (ds/acquire fd) :open (catch Exception _ :closed)))
       (.delete (java.io.File. f))))
+
+  (println "next.jdbc db-spec normalization")
+  (let [opens (atom [])
+        closes (atom 0)
+        recording
+        (reify driver/Driver
+          (descriptor [_]
+            {:id :recording-remote
+             :aliases #{"recording-remote"}
+             :uri-prefixes ["recording://"]
+             :product-name "Recording Remote"
+             :capabilities {:transactions :none :generated-keys :none}})
+          (open-handle [_ spec]
+            (swap! opens conj spec)
+            {:spec spec})
+          (close-handle [_ _]
+            (swap! closes inc)
+            nil)
+          (execute-handle [_ _ _ _]
+            {:labels [] :rows [] :count 0}))
+        remote-spec {:dbtype "recording-remote"
+                     :dbname "application"
+                     :name "fallback-name"
+                     :host "db.internal"
+                     :port 5544
+                     :user "app-user"
+                     :password "secret"
+                     :sslmode :verify-full
+                     :driver/custom {:connect-timeout-ms 2500}}
+        normalized (assoc remote-spec :vendor "recording-remote")
+        uri "recording://db.internal/application?sslmode=verify-full"]
+    (try
+      (driver/register! recording)
+      (let [conn (nj/get-connection remote-spec)] (.close conn))
+      (let [conn (nj/get-connection uri)] (.close conn))
+      (check ":dbtype preserves the complete remote driver spec"
+             normalized (first @opens))
+      (check "URI/string specs still reach the driver unchanged"
+             uri (second @opens))
+      (check "recording connections retain normal close ownership" 2 @closes)
+      (finally
+        (driver/unregister! :recording-remote))))
 
   (when-let [pg-uri (System/getenv "JOLT_TEST_PG_URI")]
     (println "next.jdbc PG value model (" pg-uri ")")

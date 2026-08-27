@@ -35,8 +35,11 @@
     (cond
       (:connection-uri spec) (:connection-uri spec)
       (:jdbcUrl spec)        (str/replace-first (:jdbcUrl spec) "jdbc:" "")
-      (:dbtype spec)         {:vendor (:dbtype spec)
-                              :name   (or (:dbname spec) (:name spec) (:subname spec))}
+      ;; A next.jdbc db-spec is also the driver's connection configuration.
+      ;; Add the alias db.driver resolves without rebuilding the map: a remote
+      ;; driver still needs host, port, credentials, and arbitrary native
+      ;; options when open-handle receives it.
+      (:dbtype spec)         (assoc spec :vendor (:dbtype spec))
       :else                  spec)
     :else spec))
 
