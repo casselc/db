@@ -10,11 +10,16 @@
   (descriptor [driver]
     "Return {:id keyword :aliases coll :uri-prefixes coll :product-name string
     :capabilities {:transactions :none|:flat|:savepoint
-                   :generated-keys :none|:returning}}.")
+                   :generated-keys :none|:returning}
+    :constraints optional driver-specific operational constraints}.")
   (open-handle [driver spec] "Open `spec` and return driver-owned state.")
   (close-handle [driver handle] "Close driver-owned state. Called at most once.")
   (execute-handle [driver handle sql params]
-    "Execute once and return {:labels [...] :rows [[...]] :count n}."))
+    "Execute exactly once and return an eager positional result
+    {:labels [string ...] :rows [[value ...] ...] :count integer}. Labels and
+    row positions must correspond. Handle concurrency is driver-defined and
+    must be surfaced in the descriptor when it is more restrictive than the
+    backing engine's ordinary connection contract."))
 
 (def ^:private transaction-modes #{:none :flat :savepoint})
 (def ^:private generated-key-modes #{:none :returning})
