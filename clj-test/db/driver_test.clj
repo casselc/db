@@ -30,6 +30,30 @@
 
 (defn- driver-id [d] (:id (driver/driver-descriptor d)))
 
+(defn- sqlite-jdbc-conformance-checks [check]
+  (println "sqlite driver SPI through jdbc.core")
+  (driver/unregister! :sqlite)
+  (require 'db.driver.sqlite :reload)
+  (let [desc (driver/driver-descriptor (driver/resolve-driver "sqlite::memory:"))]
+    (check "SQLite registers independently" :sqlite (:id desc))
+    (check "SQLite declares savepoints and generated keys"
+           {:transactions :savepoint :generated-keys :returning}
+           (:capabilities desc)))
+  (with-open [conn (jdbc/connection "sqlite::memory:")]
+    (jdbc/execute! conn "create table spi_item (id integer primary key, name text)")
+    (check "generated row returns through jdbc.core"
+           {:id 1 :name "outer"}
+           (first (jdbc/insert! conn :spi_item {:name "outer"} {:returning true})))
+    (jdbc/atomic conn
+      (try
+        (jdbc/atomic conn
+          (jdbc/insert! conn :spi_item {:name "inner"})
+          (throw (ex-info "rollback inner savepoint" {})))
+        (catch Throwable _ nil)))
+    (check "nested savepoint rollback preserves the outer connection"
+           [{:id 1 :name "outer"}]
+           (jdbc/fetch conn "select id, name from spi_item order by id"))))
+
 (defn- sqlite-ownership-checks [check]
   (println "sqlite native ownership")
   (let [h (sqlite/open ":memory:")
@@ -71,6 +95,7 @@
       (finally (sqlite/close h)))))
 
 (defn run [check]
+  (sqlite-jdbc-conformance-checks check)
   (println "driver registry and capability conformance")
   (let [calls (atom [])
         base (fake-driver (descriptor :fake #{"fake"} ["fake:"] :savepoint :returning "FakeDB") calls)

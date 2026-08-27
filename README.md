@@ -98,9 +98,10 @@ create `schema_migrations`. Errors raised by the drivers themselves also carry
 
 ## Layout
 
-- `db.sqlite` / `db.pg` — the native drivers (jolt.ffi bindings).
+- `db.sqlite` / `db.pg` — the native bindings (jolt.ffi).
+- `db.driver.sqlite` — the independently registered SQLite SPI adapter.
 - `db.driver` — the explicit driver SPI and deterministic registry.
-- `db.builtin` — SQLite/PostgreSQL adapters registered by the entry point.
+- `db.builtin` — bundled-driver loader and PostgreSQL SPI adapter.
 - `db.jdbc-shim` — the `java.sql` surface clojure.jdbc drives, over those drivers.
 - `db.jdbc` — the entry point: loads the shim, then clojure.jdbc on top of it.
 - `jdbc.core` — clojure.jdbc itself, pulled in as a dependency.

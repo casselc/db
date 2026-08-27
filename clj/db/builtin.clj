@@ -1,16 +1,10 @@
 (ns db.builtin
-  "SQLite and PostgreSQL adapters for db.driver. Loading this namespace registers
-  the built-ins but does not connect to either native library."
+  "Load the bundled db.driver adapters. Loading this namespace registers the
+  drivers but does not connect to either native library."
   (:require [clojure.string :as str]
             [db.driver :as driver]
-            [db.sqlite :as sqlite]
+            [db.driver.sqlite]
             [db.pg :as pg]))
-
-(defn- sqlite-name [spec]
-  (if (string? spec)
-    (if (str/starts-with? (str/lower-case spec) "sqlite:") (subs spec 7) spec)
-    (let [n (or (:subname spec) (:name spec) (:dbname spec))]
-      (if (str/starts-with? (str n) "//") (subs (str n) 2) (str n)))))
 
 (defn- pg-uri [{:keys [subname host port user password dbname] :as spec}]
   (if (string? spec)
@@ -34,33 +28,6 @@
              hostport)
            "/" (or (when-not (str/blank? db) db) dbname (:name spec))))))
 
-(defn- sqlite-execute [handle sql params]
-  (let [before (sqlite/total-changes handle)
-        {:keys [labels rows]} (sqlite/query-raw handle sql params)]
-    {:labels labels
-     :rows rows
-     :count (if (seq labels) 0 (- (sqlite/total-changes handle) before))}))
-
-(def sqlite-driver
-  (reify driver/Driver
-    (descriptor [_]
-      {:id :sqlite
-       :aliases #{"sqlite" "sqlite3"}
-       :uri-prefixes ["sqlite:"]
-       :product-name "SQLite"
-       :capabilities {:transactions :savepoint :generated-keys :returning}
-       :schema-sql nil})
-    (open-handle [_ spec]
-      (let [handle (sqlite/open (sqlite-name spec))]
-        (try
-          (sqlite/query-raw handle "PRAGMA foreign_keys=1;" [])
-          handle
-          (catch Throwable e
-            (sqlite/close handle)
-            (throw e)))))
-    (close-handle [_ handle] (sqlite/close handle))
-    (execute-handle [_ handle sql params] (sqlite-execute handle sql params))))
-
 (def postgresql-driver
   (reify driver/Driver
     (descriptor [_]
@@ -74,5 +41,4 @@
     (close-handle [_ handle] (pg/close handle))
     (execute-handle [_ handle sql params] (pg/execute-any handle sql params))))
 
-(driver/register! sqlite-driver)
 (driver/register! postgresql-driver)
