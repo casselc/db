@@ -134,12 +134,72 @@
                        {:field :count :actual count}))
     result))
 
+(defn- driver-execute! [conn sql params]
+  (validate-result conn
+                   (driver/execute-handle (driver-of conn) (handle conn) sql params)))
+
+(defn- setting-entry [conn setting value]
+  (get-in (descriptor-of conn) [:transaction-settings setting value]))
+
+(defn- require-setting! [conn setting value]
+  (or (setting-entry conn setting value)
+      (unsupported
+       (str (:product-name (descriptor-of conn)) " does not support transaction "
+            (name setting) " " (pr-str value)))))
+
+(defn validate-transaction-options!
+  "Fail before transaction startup when an adapter does not truthfully advertise
+  every explicitly requested setting. `:isolation` is the JDBC integer value."
+  [conn {:keys [isolation] :as options}]
+  (when (contains? options :isolation)
+    (require-setting! conn :isolation isolation))
+  (when (contains? options :read-only)
+    (require-setting! conn :read-only (boolean (:read-only options))))
+  nil)
+
+(defn- setting-statements [conn setting value context]
+  (let [entry (require-setting! conn setting value)
+        action (get entry context)
+        action (if (fn? action)
+                 (action {:connection conn :setting setting :value value
+                          :context context})
+                 action)]
+    (cond
+      (string? action) [action]
+      (and (sequential? action) (every? string? action)) (vec action)
+      :else (unsupported
+             (str (:product-name (descriptor-of conn)) " has no " (name context)
+                  " hook for transaction " (name setting) " " (pr-str value))))))
+
+(defn- apply-setting! [conn setting value context]
+  (doseq [sql (setting-statements conn setting value context)]
+    (driver-execute! conn sql [])))
+
+(defn- ensure-transaction-started! [conn]
+  (when (tget conn :tx-pending)
+    (tput! conn :tx-pending false)
+    (try
+      (driver-execute! conn "BEGIN" [])
+      (tput! conn :tx-active true)
+      (doseq [setting [:isolation :read-only]]
+        (when (contains? (tget conn :pending-transaction-settings) setting)
+          (apply-setting! conn setting
+                          (get (tget conn :pending-transaction-settings) setting)
+                          :transaction)))
+      (tput! conn :pending-transaction-settings {})
+      (catch Throwable t
+        (when (tget conn :tx-active)
+          (try (driver-execute! conn "ROLLBACK" []) (catch Throwable _ nil)))
+        (tput! conn :tx-active false)
+        (tput! conn :pending-transaction-settings {})
+        (throw t)))))
+
 (defn- run-any [conn sql params]
   (when (tget conn :closed)
     (sql-error "connection is closed"))
   (sql-try
-    (validate-result conn
-                     (driver/execute-handle (driver-of conn) (handle conn) sql params))))
+    (ensure-transaction-started! conn)
+    (driver-execute! conn sql params)))
 
 (defn- run-query
   "Execute `sql` and return {:labels [...] :rows [[v ...]]}."
@@ -323,25 +383,60 @@
 
 ;; --- java.sql.Connection -----------------------------------------------------
 ;; Transactions go through the same BEGIN / SAVEPOINT sequence the drivers already
-;; understand. Autocommit off means a transaction is open, so BEGIN is issued on
-;; the transition rather than eagerly.
+;; understand. BEGIN is deferred until the first ordinary or driver-extension
+;; operation so every requested setting can be validated before any SQL runs.
 (defn- make-connection [drv descriptor handle]
-  (let [t (tt :jdbc/connection)]
+  (let [t (tt :jdbc/connection)
+        defaults (get-in descriptor [:transaction-settings :defaults])]
     (tput! t :vendor (:id descriptor))
     (tput! t :driver drv)
     (tput! t :descriptor descriptor)
     (tput! t :handle handle)
     (tput! t :autocommit true)
-    (tput! t :readonly false)
-    (tput! t :isolation 2)                       ; TRANSACTION_READ_COMMITTED
+    (tput! t :readonly (boolean (get defaults :read-only false)))
+    (tput! t :isolation (get defaults :isolation 2))
+    (tput! t :tx-active false)
+    (tput! t :tx-pending false)
+    (tput! t :pending-transaction-settings {})
+    (tput! t :transaction-setting-baseline nil)
     (tput! t :savepoints [])
     (tput! t :closed false)
     t))
 
-(defn- exec! [conn sql] (run-update conn sql []))
+(defn- exec! [conn sql] (:count (driver-execute! conn sql [])))
 
 (defn- transaction-mode [conn]
   (get-in (descriptor-of conn) [:capabilities :transactions]))
+
+(defn- set-transaction-setting! [conn setting field value]
+  (when-not (= value (tget conn field))
+    (try
+      (require-setting! conn setting value)
+      (catch Throwable t
+        ;; clojure.jdbc calls setAutoCommit(false) before its option setters.
+        ;; A rejected option must unwind that deferred, SQL-free begin so the
+        ;; connection remains usable and no earlier supported option is staged.
+        (when (tget conn :tx-pending)
+          (doseq [[baseline-field baseline-value]
+                  (tget conn :transaction-setting-baseline)]
+            (tput! conn baseline-field baseline-value))
+          (tput! conn :autocommit true)
+          (tput! conn :tx-pending false)
+          (tput! conn :pending-transaction-settings {})
+          (tput! conn :transaction-setting-baseline nil))
+        (throw t)))
+    (cond
+      (tget conn :autocommit)
+      (apply-setting! conn setting value :session)
+
+      (tget conn :tx-pending)
+      (tput! conn :pending-transaction-settings
+             (assoc (tget conn :pending-transaction-settings) setting value))
+
+      :else
+      (apply-setting! conn setting value :transaction))
+    (tput! conn field value))
+  nil)
 
 (clojure.core/__register-class-methods! :jdbc/connection
   {"createStatement"  (fn [self & _] (make-statement self))
@@ -360,32 +455,61 @@
                      (let [v (boolean v)]
                        (when (not= v (tget self :autocommit))
                          (if v
-                           (when-not (tget self :closed) (exec! self "COMMIT"))
+                           (do
+                             (when (and (not (tget self :closed))
+                                        (tget self :tx-active))
+                               (exec! self "COMMIT"))
+                             (tput! self :tx-active false)
+                             (tput! self :tx-pending false)
+                             (tput! self :pending-transaction-settings {})
+                             (tput! self :transaction-setting-baseline nil))
                            (if (= :none (transaction-mode self))
                              (unsupported (str "transactions are not supported by "
                                                (:product-name (descriptor-of self))))
-                             (exec! self "BEGIN")))
+                             (do
+                               ;; Defer BEGIN until the first statement. The
+                               ;; transaction strategy sets and validates all
+                               ;; options after this call, so unsupported options
+                               ;; fail before any SQL or user body runs.
+                               (tput! self :tx-pending true)
+                               (tput! self :pending-transaction-settings {})
+                               (tput! self :transaction-setting-baseline
+                                      {:isolation (tget self :isolation)
+                                       :readonly (tget self :readonly)}))))
                          (tput! self :autocommit v))
                        nil))
    "getAutoCommit" (fn [self] (tget self :autocommit))
 
    "commit" (fn [self]
-              (exec! self "COMMIT")
-              (when-not (tget self :autocommit) (exec! self "BEGIN"))
+              (when (tget self :tx-active) (exec! self "COMMIT"))
+              (tput! self :tx-active false)
+              (when-not (tget self :autocommit)
+                (tput! self :tx-pending true)
+                (tput! self :pending-transaction-settings {})
+                (tput! self :transaction-setting-baseline
+                       {:isolation (tget self :isolation)
+                        :readonly (tget self :readonly)}))
               nil)
    "rollback" (fn [self & [sp]]
                 (if sp
                   (do
                     (exec! self (str "ROLLBACK TO SAVEPOINT " (tget sp :name)))
                     (exec! self (str "RELEASE SAVEPOINT " (tget sp :name))))
-                  (do (exec! self "ROLLBACK")
-                      (when-not (tget self :autocommit) (exec! self "BEGIN"))))
+                  (do (when (tget self :tx-active) (exec! self "ROLLBACK"))
+                      (tput! self :tx-active false)
+                      (when-not (tget self :autocommit)
+                        (tput! self :tx-pending true)
+                        (tput! self :pending-transaction-settings {})
+                        (tput! self :transaction-setting-baseline
+                               {:isolation (tget self :isolation)
+                                :readonly (tget self :readonly)}))))
                 nil)
 
    "setSavepoint" (fn [self & [nm]]
                     (when-not (= :savepoint (transaction-mode self))
                       (unsupported (str "nested transactions are not supported by "
-                                        (:product-name (descriptor-of self)))))
+                                               (:product-name (descriptor-of self)))))
+                    (ensure-transaction-started! self)
                     (let [n (count (tget self :savepoints))
                           name (or nm (str "jdbc_sp_" n))
                           sp (tt :jdbc/savepoint)]
@@ -397,9 +521,11 @@
                         (exec! self (str "RELEASE SAVEPOINT " (tget sp :name)))
                         nil)
 
-   "setReadOnly" (fn [self v] (tput! self :readonly (boolean v)) nil)
+   "setReadOnly" (fn [self v]
+                   (set-transaction-setting! self :read-only :readonly (boolean v)))
    "isReadOnly"  (fn [self] (tget self :readonly))
-   "setTransactionIsolation" (fn [self v] (tput! self :isolation v) nil)
+   "setTransactionIsolation" (fn [self v]
+                               (set-transaction-setting! self :isolation :isolation v))
    "getTransactionIsolation" (fn [self] (tget self :isolation))
    "setSchema" (fn [self s]
                  (when-let [schema-sql (and s (:schema-sql (descriptor-of self)))]
@@ -475,6 +601,11 @@
    (let [descriptor (descriptor-of conn)]
      (when (and expected-id (not= expected-id (:id descriptor)))
        (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
+     ;; Driver-specific operations (DuckDB Appender, chDB streaming, etc.) bypass
+     ;; execute-handle, so crossing this extension seam must materialize the same
+     ;; deferred BEGIN/settings as an ordinary SQL statement. Validate identity
+     ;; first so a wrong-driver request has no transaction side effect.
+     (sql-try (ensure-transaction-started! conn))
      {:driver (driver-of conn) :descriptor descriptor :handle (handle conn)})))
 
 (defn connection

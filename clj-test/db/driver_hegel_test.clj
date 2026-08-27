@@ -286,6 +286,27 @@
           state)))
 
      (hs/rule
+      :reject-unadvertised-transaction-setting
+      {:precondition #(not (:closed? %))}
+      (fn [{:keys [conn calls] :as state}]
+        (let [before (count @calls)
+              body-ran (atom false)
+              outcome (try
+                        (jdbc/atomic conn {:isolation-level :serializable}
+                          (reset! body-ran true))
+                        :accepted
+                        (catch java.sql.SQLException _ :unsupported))
+              after (count @calls)]
+          (ensure! "db.connection/unsupported-setting" (= :unsupported outcome)
+                   "unadvertised transaction setting was accepted" {})
+          (ensure! "db.connection/unsupported-setting-body" (not @body-ran)
+                   "unadvertised transaction setting ran its body" {})
+          (ensure! "db.connection/unsupported-setting-sql" (= before after)
+                   "unadvertised transaction setting executed driver SQL"
+                   {:before before :after after})
+          state)))
+
+     (hs/rule
       :close
       {:precondition #(not (:closed? %))}
       (fn [{:keys [conn] :as state}]

@@ -68,6 +68,18 @@ the drivers cannot see table names, so upstream's qualified default is not
 reproducible, and `next.jdbc.result-set` builder markers are accepted and
 ignored.
 
+Transaction settings are fail-closed capabilities, not bookkeeping flags.
+SQLite applies `:serializable` / `:read-uncommitted` through `PRAGMA
+read_uncommitted` and enforces `:read-only` with `PRAGMA query_only`. PostgreSQL
+maps its accepted JDBC isolation levels and read-only/read-write modes to
+transaction/session `SET` statements. Settings are applied before the first
+body statement and restored after commit or rollback. A driver descriptor
+without `:transaction-settings` (including an older external DuckDB adapter)
+may still run ordinary transactions, but explicit `:isolation` or `:read-only`
+options are rejected before `BEGIN`, user code, or driver SQL. Nested savepoint
+transactions reject explicit settings because they cannot truthfully change an
+already-active outer transaction.
+
 A datasource is `db.datasource`: an explicit `open-datasource` / `acquire` /
 `release` / `close-datasource` lifecycle over the drivers. It is a connection
 factory, not a pool — pooling can grow behind the same surface later, and this
@@ -130,7 +142,10 @@ An external driver implements `db.driver/Driver` and calls `db.driver/register!`
 when its namespace is explicitly required. The SPI is deliberately narrow:
 open a handle, close it once, and execute one statement once, returning ordered
 labels/rows plus an affected-row count. Transactions and generated keys are
-declared as capabilities and enforced by the shared JDBC shim.
+declared as capabilities and enforced by the shared JDBC shim. Drivers that
+support transaction options additionally publish `:transaction-settings`:
+defaults plus JDBC isolation/read-only values mapped to transaction and session
+SQL (or adapter hooks). Absence means explicit settings are unsupported.
 
 Registry aliases are exact for map specs and URI strings use the longest
 registered prefix. Conflicting aliases or prefixes are rejected. Requiring a

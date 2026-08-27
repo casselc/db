@@ -11,6 +11,11 @@
     "Return {:id keyword :aliases coll :uri-prefixes coll :product-name string
     :capabilities {:transactions :none|:flat|:savepoint
                    :generated-keys :none|:returning}
+    :transaction-settings optionally describes truthful JDBC transaction
+    settings as {:defaults {:isolation int :read-only boolean}
+                 :isolation {jdbc-int {:transaction sql :session sql}}
+                 :read-only {boolean {:transaction sql :session sql}}}.
+    Missing setting metadata means explicit transaction options are unsupported.
     :constraints optional driver-specific operational constraints}.")
   (open-handle [driver spec] "Open `spec` and return driver-owned state.")
   (close-handle [driver handle] "Close driver-owned state. Called at most once.")
@@ -43,6 +48,10 @@
     (when-not (generated-key-modes keys-mode)
       (throw (ex-info "invalid driver generated-keys capability"
                       {:driver-id id :generated-keys keys-mode})))
+    (when (and (contains? d :transaction-settings)
+               (not (map? (:transaction-settings d))))
+      (throw (ex-info "driver :transaction-settings must be a map"
+                      {:driver-id id :transaction-settings (:transaction-settings d)})))
     (assoc d
            :aliases (set (map normalized-alias (conj (vec (:aliases d)) id)))
            :uri-prefixes (set (map (comp str/lower-case str) (:uri-prefixes d))))))

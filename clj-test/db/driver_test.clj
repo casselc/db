@@ -1,6 +1,7 @@
 (ns db.driver-test
   (:require [clojure.string :as str]
             [db.driver :as driver]
+            [db.jdbc-shim :as shim]
             [db.sqlite :as sqlite]
             [jdbc.core :as jdbc]
             [jdbc.proto :as proto]))
@@ -189,6 +190,57 @@
                         (catch java.sql.SQLException _ :unsupported))))
           (check "flat nested body was not run" false @nested-ran)))
       (finally (driver/unregister! :tx-flat))))
+
+  (let [calls (atom [])
+        settings-desc
+        (assoc (descriptor :tx-settings #{"tx-settings"} ["tx-settings:"]
+                           :flat :none "SettingsTx")
+               :transaction-settings
+               {:defaults {:isolation 2 :read-only false}
+                :isolation
+                {2 {:transaction "TX ISOLATION 2" :session "SESSION ISOLATION 2"}
+                 8 {:transaction "TX ISOLATION 8" :session "SESSION ISOLATION 8"}}
+                :read-only
+                {true {:transaction "TX READ ONLY" :session "SESSION READ ONLY"}
+                 false {:transaction "TX READ WRITE" :session "SESSION READ WRITE"}}})
+        settings-driver (fake-driver settings-desc calls)]
+    (try
+      (driver/register! settings-driver)
+      (with-open [conn (jdbc/connection "tx-settings:value")]
+        (jdbc/atomic conn {:isolation-level :serializable :read-only true}
+          (jdbc/execute! conn "update t set x = 3"))
+        (check "advertised transaction settings apply before body and restore after"
+               ["BEGIN" "TX ISOLATION 8" "TX READ ONLY" "update t set x = 3"
+                "COMMIT" "SESSION ISOLATION 2" "SESSION READ WRITE"]
+               (mapv second (filter #(= :execute (first %)) @calls)))
+        (reset! calls [])
+        (jdbc/atomic conn
+          (shim/driver-context (proto/connection conn) :tx-settings))
+        (check "driver extension context materializes a pending transaction"
+               ["BEGIN" "COMMIT"]
+               (mapv second (filter #(= :execute (first %)) @calls))))
+      (finally (driver/unregister! :tx-settings))))
+
+  (let [calls (atom [])
+        legacy (fake-driver (descriptor :tx-legacy #{"tx-legacy"} ["tx-legacy:"]
+                                        :flat :none "LegacyTx") calls)]
+    (try
+      (driver/register! legacy)
+      (with-open [conn (jdbc/connection "tx-legacy:value")]
+        (let [body-ran (atom false)]
+          (check "legacy driver rejects unadvertised setting before body" :unsupported
+                 (try
+                   (jdbc/atomic conn {:isolation-level :serializable}
+                     (reset! body-ran true))
+                   :ran
+                   (catch java.sql.SQLException _ :unsupported)))
+          (check "legacy setting rejection skips body" false @body-ran)
+          (check "legacy setting rejection executes no SQL" []
+                 (filterv #(= :execute (first %)) @calls))
+          (jdbc/atomic conn (jdbc/execute! conn "update t set x = 4"))
+          (check "legacy setting rejection leaves connection usable" true
+                 (some #(= [:execute "update t set x = 4" []] %) @calls))))
+      (finally (driver/unregister! :tx-legacy))))
 
   (println "driver result boundary validation")
   (let [result (atom {:labels [] :rows [] :count 0})

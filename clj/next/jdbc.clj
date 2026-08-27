@@ -19,6 +19,7 @@
   queries — all built from jolt core's generic host hooks."
   (:require [db.jdbc]                       ; loads the shim BEFORE jdbc.core compiles
             [db.jdbc-shim :as shim]
+            [jdbc.constants :as constants]
             [jdbc.core :as jc]
             [jdbc.proto :as proto]
             [db.datasource :as ds]
@@ -198,14 +199,43 @@
   [connectable f opts]
   (call-with-connection connectable
     (fn [w]
-      (jc/atomic-apply
-       (conn-raw w)
-       (fn [raw]
-         (when (:rollback-only opts) (jc/set-rollback! raw))
-         (f (wrap-conn raw)))
-       (cond-> {}
-         (:isolation opts) (assoc :isolation-level (:isolation opts))
-         (contains? opts :read-only) (assoc :read-only (:read-only opts)))))))
+      (let [raw (conn-raw w)
+            shim-conn (proto/connection raw)
+            explicit-settings? (or (:isolation opts)
+                                   (contains? opts :read-only))
+            isolation (when-let [level (:isolation opts)]
+                        (or (get constants/isolation-levels level)
+                            (throw (IllegalArgumentException.
+                                    (str "Invalid isolation level: " level)))))
+            force-read-write? (and (contains? opts :read-only)
+                                   (false? (:read-only opts)))
+            previous-read-only (when force-read-write? (.isReadOnly shim-conn))]
+        (when (and explicit-settings? (:transaction (meta raw)))
+          (throw (jolt.host/throwable
+                  "java.sql.SQLFeatureNotSupportedException"
+                  "nested transaction options cannot be applied after the outer transaction has started")))
+        (shim/validate-transaction-options!
+         shim-conn
+         (cond-> {}
+           isolation (assoc :isolation isolation)
+           (contains? opts :read-only) (assoc :read-only (:read-only opts))))
+        ;; clojure.jdbc uses when-let for :read-only and therefore skips false.
+        ;; Apply that meaningful read-write request at session scope around its
+        ;; transaction strategy, with explicit restoration.
+        (when force-read-write? (.setReadOnly shim-conn false))
+        (try
+          (jc/atomic-apply
+           raw
+           (fn [raw]
+             (when (:rollback-only opts) (jc/set-rollback! raw))
+             (f (wrap-conn raw)))
+           (cond-> {}
+             (:isolation opts) (assoc :isolation-level (:isolation opts))
+             (and (contains? opts :read-only) (not force-read-write?))
+             (assoc :read-only (:read-only opts))))
+          (finally
+            (when force-read-write?
+              (.setReadOnly shim-conn previous-read-only))))))))
 
 (defmacro with-transaction
   "(with-transaction [t-con connectable opts?] body...) — run body in a

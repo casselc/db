@@ -249,6 +249,22 @@
        :uri-prefixes ["postgres://" "postgresql://"]
        :product-name "PostgreSQL"
        :capabilities {:transactions :savepoint :generated-keys :returning}
+       :transaction-settings
+       {:defaults {:isolation 2 :read-only false}
+        :isolation
+        {1 {:transaction "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
+            :session "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"}
+         2 {:transaction "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+            :session "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"}
+         4 {:transaction "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            :session "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ"}
+         8 {:transaction "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+            :session "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE"}}
+        :read-only
+        {true {:transaction "SET TRANSACTION READ ONLY"
+               :session "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"}
+         false {:transaction "SET TRANSACTION READ WRITE"
+                :session "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"}}}
        :constraints {:handle-concurrency :serialized}
        :schema-sql (fn [schema] (str "SET search_path TO " schema))})
     (open-handle [_ spec] (pg/connect (pg-uri spec)))

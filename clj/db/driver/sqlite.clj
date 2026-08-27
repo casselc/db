@@ -26,6 +26,16 @@
        :uri-prefixes ["sqlite:"]
        :product-name "SQLite"
        :capabilities {:transactions :savepoint :generated-keys :returning}
+       :transaction-settings
+       {:defaults {:isolation 8 :read-only false}
+        :isolation
+        {1 {:transaction "PRAGMA read_uncommitted=1"
+            :session "PRAGMA read_uncommitted=1"}
+         8 {:transaction "PRAGMA read_uncommitted=0"
+            :session "PRAGMA read_uncommitted=0"}}
+        :read-only
+        {true {:transaction "PRAGMA query_only=1" :session "PRAGMA query_only=1"}
+         false {:transaction "PRAGMA query_only=0" :session "PRAGMA query_only=0"}}}
        :schema-sql nil})
     (open-handle [_ spec]
       (let [handle (sqlite/open (sqlite-name spec))]

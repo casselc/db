@@ -23,6 +23,14 @@
          :serialized
          (get-in (driver/descriptor builtin/postgresql-driver)
                  [:constraints :handle-concurrency]))
+  (let [settings (:transaction-settings
+                  (driver/descriptor builtin/postgresql-driver))]
+    (check "postgres advertises concrete serializable transaction SQL"
+           "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+           (get-in settings [:isolation 8 :transaction]))
+    (check "postgres advertises concrete read-only restoration SQL"
+           "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"
+           (get-in settings [:read-only false :session])))
 
   (let [uri-fn @(private-var 'db.builtin 'pg-uri)
         password "not-for-output /?#"

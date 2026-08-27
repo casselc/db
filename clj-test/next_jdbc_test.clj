@@ -3,6 +3,7 @@
   real contract, datasources, with-transaction options, and the PG value
   model. Called from jdbc.core-test/-main; shares its check/failures plumbing."
   (:require [jdbc.core :as jc]
+            [jdbc.proto :as proto]
             [next.jdbc :as nj]
             [next.jdbc.sql :as sql]
             [db.datasource :as ds]
@@ -53,10 +54,61 @@
       (nj/execute! tx ["insert into t (x) values (?)" 777]))
     (check ":rollback-only discards the block" 0
            (count (sql/query conn ["select * from t where x = ?" 777])))
-    (nj/with-transaction [tx conn {:isolation :serializable}]
+    (nj/with-transaction [tx conn {:isolation :read-uncommitted}]
+      (check "SQLite applies requested isolation before body SQL" 1
+             (:read_uncommitted
+              (nj/execute-one! tx ["PRAGMA read_uncommitted"])))
       (nj/execute! tx ["insert into t (x) values (?)" 778]))
-    (check ":isolation is accepted and the block commits" 1
+    (check "supported :isolation commits" 1
            (count (sql/query conn ["select * from t where x = ?" 778])))
+    (check "SQLite isolation is restored after transaction" 0
+           (:read_uncommitted (nj/execute-one! conn ["PRAGMA read_uncommitted"])))
+    (let [body-ran (atom false)
+          before (count (sql/query conn "select * from t"))]
+      (check "unsupported SQLite isolation fails closed" :unsupported
+             (try
+               (nj/with-transaction [tx conn {:isolation :repeatable-read}]
+                 (reset! body-ran true)
+                 (nj/execute! tx ["insert into t (x) values (?)" 779]))
+               :ran
+               (catch java.sql.SQLException _ :unsupported)))
+      (check "unsupported isolation rejects before transaction body" false @body-ran)
+      (check "unsupported isolation executes no body SQL" before
+             (count (sql/query conn "select * from t"))))
+    (let [write-outcome
+          (try
+            (nj/with-transaction [tx conn {:read-only true}]
+              (check "SQLite applies read-only before body SQL" 1
+                     (:query_only (nj/execute-one! tx ["PRAGMA query_only"])))
+              (nj/execute! tx ["insert into t (x) values (?)" 780]))
+            :wrote
+            (catch java.sql.SQLException _ :rejected))]
+      (check "SQLite read-only transaction rejects writes" :rejected write-outcome)
+      (check "SQLite read-only state is restored" 0
+             (:query_only (nj/execute-one! conn ["PRAGMA query_only"])))
+      (check "writes work after read-only restoration" 1
+             (:next.jdbc/update-count
+              (nj/execute-one! conn ["insert into t (x) values (?)" 780]))))
+    (let [shim-conn (proto/connection (nj/conn-raw conn))]
+      (.setReadOnly shim-conn true)
+      (nj/with-transaction [tx conn {:read-only false}]
+        (check "explicit read-only false applies read-write mode" 0
+               (:query_only (nj/execute-one! tx ["PRAGMA query_only"]))))
+      (check "explicit read-only false restores previous session mode" 1
+             (:query_only (nj/execute-one! conn ["PRAGMA query_only"])))
+      (.setReadOnly shim-conn false))
+    (nj/with-transaction [outer conn]
+      (let [nested-body (atom false)]
+        (check "nested explicit transaction settings fail honestly" :unsupported
+               (try
+                 (nj/with-transaction [inner outer {:read-only true}]
+                   (reset! nested-body true))
+                 :ran
+                 (catch java.sql.SQLException _ :unsupported)))
+        (check "nested setting rejection occurs before nested body" false @nested-body))
+      (nj/execute! outer ["insert into t (x) values (?)" 781]))
+    (check "outer transaction remains usable after nested option rejection" 1
+           (count (sql/query conn ["select * from t where x = ?" 781])))
 
     (check ".close closes the underlying handle" :closed
            (do (.close conn)
@@ -129,6 +181,40 @@
       (check "recording connections retain normal close ownership" 2 @closes)
       (finally
         (driver/unregister! :recording-remote))))
+
+  ;; Third-party drivers compiled against the SPI remain loadable, but an older
+  ;; descriptor that has no transaction-setting metadata must not silently
+  ;; pretend that next.jdbc options took effect.
+  (let [calls (atom [])
+        external-duckdb
+        (reify driver/Driver
+          (descriptor [_]
+            {:id :duckdb
+             :aliases #{"duckdb-external"}
+             :uri-prefixes ["duckdb-external:"]
+             :product-name "External DuckDB"
+             :capabilities {:transactions :flat :generated-keys :none}})
+          (open-handle [_ _] calls)
+          (close-handle [_ _] nil)
+          (execute-handle [_ _ sql params]
+            (swap! calls conj [sql (vec params)])
+            {:labels [] :rows [] :count 0}))]
+    (try
+      (driver/register! external-duckdb)
+      (with-open [conn (nj/get-connection "duckdb-external::memory:")]
+        (let [body-ran (atom false)]
+          (check "external DuckDB without setting metadata fails honestly"
+                 :unsupported
+                 (try
+                   (nj/with-transaction [tx conn {:isolation :serializable}]
+                     (reset! body-ran true)
+                     (nj/execute! tx ["update t set x = 1"]))
+                   :ran
+                   (catch java.sql.SQLException _ :unsupported)))
+          (check "external DuckDB option rejects before body" false @body-ran)
+          (check "external DuckDB option executes no SQL" [] @calls)))
+      (finally
+        (driver/unregister! :duckdb))))
 
   (when-let [pg-uri (System/getenv "JOLT_TEST_PG_URI")]
     (println "next.jdbc PG value model (" pg-uri ")")
