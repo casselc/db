@@ -88,6 +88,22 @@ Parameters: uuids and temporal values bind as their text form and postgres
 infers the type; a vector binds as an array literal, which pairs with a cast
 at the use site (`?::text[]`). SQLite stores anything it does not know as text.
 
+PostgreSQL map specs retain their complete remote connection configuration:
+
+```clojure
+{:dbtype "postgresql"
+ :host "db.internal" :port 5432
+ :user "app" :password "..." :dbname "application"
+ :sslmode "verify-full" :connect-timeout 5
+ :pg/options {:channel-binding "require"}}
+```
+
+`:pg/options` (or a map-valued `:options`) carries arbitrary libpq URI query
+parameters. Common `:sslmode`, `:connect-timeout`, `:application-name`,
+`:target-session-attrs`, and `:keepalives` keys are accepted at top level.
+Credentials are URI-encoded for libpq and are never attached to connection
+errors or logged by the driver.
+
 ## Errors
 
 Database errors satisfy `(catch java.sql.SQLException ...)`, so code written
@@ -136,3 +152,10 @@ and collect-safe blocking calls introduced by v0.7.23.
 jolt -M:test                                   # sqlite
 JOLT_TEST_PG_URI=postgres://... jolt -M:test   # also runs the postgres suite
 ```
+
+The default suite exercises PostgreSQL URI construction, handle ownership,
+serialization, failure cleanup, and lifecycle swarms with injected libpq calls;
+it does not pretend that those fakes prove a native client/server exchange. Set
+`JOLT_TEST_PG_URI` to a disposable real PostgreSQL database to enable the
+existing end-to-end libpq value, parameter, transaction, and bytea checks. The
+integration suite creates and drops tables prefixed `jolt_` / `nj_`.

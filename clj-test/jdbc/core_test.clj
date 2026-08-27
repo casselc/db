@@ -6,6 +6,7 @@
   (:require [db.jdbc]
             [db.driver-test]
             [db.driver-hegel-test]
+            [db.pg-test]
             [next-jdbc-test]
             [jdbc.core :as jdbc]
             ;; the placeholder rewriter lives in the pg driver; requiring it here
@@ -281,6 +282,7 @@
 
   (db.driver-test/run check)
   (db.driver-hegel-test/run check)
+  (db.pg-test/run check)
   (next-jdbc-test/run check)
 
   (if (pos? @failures)

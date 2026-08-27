@@ -13,11 +13,11 @@
 ;; opens a postgres connection: ffi/defcfn resolves a symbol on first call, so this
 ;; namespace loads either way.
 
-(ffi/defcfn PQconnectdb        "PQconnectdb"        [:string] :pointer)
+(ffi/defcfn PQconnectdb        "PQconnectdb"        [:pointer] :pointer :blocking)
 (ffi/defcfn PQstatus           "PQstatus"           [:pointer] :int)
 (ffi/defcfn PQerrorMessage     "PQerrorMessage"     [:pointer] :string)
-(ffi/defcfn PQfinish           "PQfinish"           [:pointer] :void)
-(ffi/defcfn PQexecParams       "PQexecParams"       [:pointer :string :int :pointer :pointer :pointer :pointer :int] :pointer)
+(ffi/defcfn PQfinish           "PQfinish"           [:pointer] :void :blocking)
+(ffi/defcfn PQexecParams       "PQexecParams"       [:pointer :pointer :int :pointer :pointer :pointer :pointer :int] :pointer :blocking)
 (ffi/defcfn PQresultStatus     "PQresultStatus"     [:pointer] :int)
 (ffi/defcfn PQresultErrorMessage "PQresultErrorMessage" [:pointer] :string)
 (ffi/defcfn PQcmdTuples         "PQcmdTuples"         [:pointer] :string)
@@ -51,14 +51,50 @@
    1009 25, 1014 25, 1015 25, 2951 2950
    1115 1114, 1185 1184, 1182 1082, 1183 1083, 1270 1266})
 
-(defn connect [uri]
-  (let [conn (PQconnectdb uri)]
-    (when-not (= CONNECTION-OK (PQstatus conn))
-      (let [msg (PQerrorMessage conn)] (PQfinish conn)
-        (throw (ex-info (str "pg connect failed: " msg) {:jdbc/sql-error true}))))
-    conn))
+(defn- sql-ex [message data]
+  (ex-info message (assoc data :jdbc/sql-error true)))
 
-(defn close [conn] (PQfinish conn) nil)
+(defrecord PgHandle [ptr closed? lock])
+
+(defn connect [uri]
+  (ffi/with-c-string [uri-ptr uri]
+    (let [conn (PQconnectdb uri-ptr)]
+      (when (ffi/null? conn)
+        (throw (sql-ex "pg connect returned a null connection" {})))
+      (let [transferred? (atom false)]
+        (try
+          (if (= CONNECTION-OK (PQstatus conn))
+            (let [handle (->PgHandle conn (atom false) (Object.))]
+              (reset! transferred? true)
+              handle)
+            (let [message (try
+                            (or (PQerrorMessage conn) "unknown connection error")
+                            (catch Throwable _
+                              "unable to read connection error"))]
+              ;; Never attach or print the URI: it may contain a password.
+              (throw (sql-ex (str "pg connect failed: " message) {}))))
+          (finally
+            ;; PQconnectdb returns an owned PGconn even for a failed connection.
+            ;; Also consume it if status/error inspection itself throws.
+            (when-not @transferred?
+              (PQfinish conn))))))))
+
+(defn close [handle]
+  (locking (:lock handle)
+    ;; Fail closed if the native destructor itself throws: a consumed PGconn may
+    ;; never be retried or exposed to another query.
+    (when (compare-and-set! (:closed? handle) false true)
+      (PQfinish (:ptr handle))))
+  nil)
+
+(defn with-live-handle
+  "Serialize one operation against a live PGconn. The pointer never escapes the
+  callback and close takes the same lock."
+  [handle f]
+  (locking (:lock handle)
+    (when @(:closed? handle)
+      (throw (sql-ex "postgres connection is closed" {:db.pg/closed true})))
+    (f (:ptr handle))))
 
 ;; --- bytea → byte-array ------------------------------------------------------
 ;; Results are still requested in text format (PQexecParams resultFormat 0), so a
@@ -254,21 +290,33 @@
         :else           (str v)))
 (defn pg-array-literal [xs] (str "{" (str/join "," (map pg-array-el xs)) "}"))
 
+(defn- own! [owned pointer]
+  (when (ffi/null? pointer)
+    (throw (sql-ex "postgres parameter allocation returned null" {})))
+  (swap! owned conj pointer)
+  pointer)
+
+(defn- allocate! [owned size]
+  (own! owned (ffi/alloc size)))
+
+(defn- string-pointer! [owned value]
+  (own! owned (ffi/string->ptr value)))
+
 (defn- param-arrays
   "Build PQexecParams' type / value / length / format arrays for `params`.
-  Returns [types values lengths formats owned], where owned is every pointer the
-  caller must free once the call has returned."
-  [params]
+  Every non-null pointer is registered in `owned` immediately; the surrounding
+  query scope frees that registry on success or failure."
+  [params owned]
   (let [n (count params)]
     (if (zero? n)
-      [ffi/null ffi/null ffi/null ffi/null []]
+      [ffi/null ffi/null ffi/null ffi/null]
       (let [ps (ffi/sizeof :pointer)
             is (ffi/sizeof :int)
             os (ffi/sizeof :uint)
-            types   (ffi/alloc (* n os))
-            values  (ffi/alloc (* n ps))
-            lengths (ffi/alloc (* n is))
-            formats (ffi/alloc (* n is))
+            types   (allocate! owned (* n os))
+            values  (allocate! owned (* n ps))
+            lengths (allocate! owned (* n is))
+            formats (allocate! owned (* n is))
             ;; a NULL value pointer is how libpq reads a SQL NULL, so an empty
             ;; byte array still needs a pointer of its own to stay distinct from
             ;; nil — hence the 1-byte floor on a 0-length payload.
@@ -276,11 +324,11 @@
                           (cond
                             (nil? v)   [INFER-OID ffi/null 0 TEXT-FORMAT]
                             (bytes? v) (let [len (alength v)
-                                             p (ffi/alloc (max 1 len))]
+                                             p (allocate! owned (max 1 len))]
                                          (ffi/write-array p v)
                                          [bytea-oid p len BINARY-FORMAT])
-                            (sequential? v) [INFER-OID (ffi/string->ptr (pg-array-literal v)) 0 TEXT-FORMAT]
-                            :else      [INFER-OID (ffi/string->ptr (str v)) 0 TEXT-FORMAT]))
+                            (sequential? v) [INFER-OID (string-pointer! owned (pg-array-literal v)) 0 TEXT-FORMAT]
+                            :else      [INFER-OID (string-pointer! owned (str v)) 0 TEXT-FORMAT]))
                         params)]
         (dotimes [i n]
           (let [[oid p len fmt] (nth cells i)]
@@ -288,32 +336,97 @@
             (ffi/write values  :pointer (* i ps) p)
             (ffi/write lengths :int     (* i is) len)
             (ffi/write formats :int     (* i is) fmt)))
-        [types values lengths formats
-         (into [types values lengths formats]
-               (remove (fn [p] (ffi/null? p)) (mapv second cells)))]))))
+        [types values lengths formats]))))
 
-(defn- run [conn sql params]
-  (let [[types values lengths formats owned] (param-arrays params)
-        ;; callers write JDBC ? placeholders; postgres wants $1..$N
-        res (PQexecParams conn (pg-placeholders sql) (count params)
-                          types values lengths formats 0)]
-    (doseq [p owned] (ffi/free p))
-    (let [st (PQresultStatus res)]
-      (when-not (or (= st PGRES-COMMAND-OK) (= st PGRES-TUPLES-OK))
-        (let [msg (PQresultErrorMessage res)] (PQclear res)
-          (throw (ex-info (str "pg query failed: " msg)
-                          {:sql sql :jdbc/sql-error true}))))
-      res)))
+(defn- run-result [conn sql params]
+  (let [owned (atom [])]
+    (try
+      (let [[types values lengths formats] (param-arrays params owned)
+            rewritten (pg-placeholders sql)
+            ;; Collect-safe FFI cannot accept a Scheme string argument, so keep
+            ;; the rewritten query in a scoped C buffer for the blocking call.
+            res (ffi/with-c-string [sql-ptr rewritten]
+                  (PQexecParams conn sql-ptr (count params)
+                                types values lengths formats 0))]
+        (when (ffi/null? res)
+          (throw (sql-ex "pg query returned a null result" {:sql sql})))
+        (let [transferred? (atom false)]
+          (try
+            (let [status (PQresultStatus res)]
+              (if (or (= status PGRES-COMMAND-OK) (= status PGRES-TUPLES-OK))
+                (let [nfields (PQnfields res)
+                      ntuples (PQntuples res)]
+                  (when-not (and (integer? nfields) (not (neg? nfields))
+                                 (integer? ntuples) (not (neg? ntuples)))
+                    (throw (sql-ex "postgres returned malformed result dimensions"
+                                   {:sql sql :status status})))
+                  ;; libpq defines PGRES_COMMAND_OK as a result with no tuple
+                  ;; shape. Do not let corrupt/native-mismatched dimensions turn
+                  ;; a command into rows or drive an unsafe range traversal.
+                  (when (and (= status PGRES-COMMAND-OK)
+                             (or (pos? nfields) (pos? ntuples)))
+                    (throw (sql-ex "postgres returned dimensions inconsistent with command status"
+                                   {:sql sql :status status})))
+                  (let [owned-result {:pointer res :status status
+                                      :nfields nfields :ntuples ntuples}]
+                    (reset! transferred? true)
+                    owned-result))
+                (let [message (try
+                                (or (PQresultErrorMessage res) "unknown query error")
+                                (catch Throwable _ "unable to read query error"))]
+                  (throw (sql-ex (str "pg query failed: " message)
+                                 {:sql sql :status status})))))
+            (finally
+              ;; Until a successful status transfers ownership to with-result,
+              ;; this scope owns every non-null PGresult, including when status
+              ;; or error-message inspection throws.
+              (when-not @transferred?
+                (PQclear res))))))
+      (finally
+        (doseq [pointer (reverse @owned)]
+          (ffi/free pointer))))))
+
+(defn- with-result [handle sql params f]
+  (with-live-handle
+   handle
+   (fn [conn]
+     (let [{:keys [pointer] :as result} (run-result conn sql params)]
+       (try
+         (f result)
+         (finally
+           (PQclear pointer)))))))
+
+(defn- command-count [result sql]
+  (let [raw (PQcmdTuples (:pointer result))]
+    (cond
+      (nil? raw)
+      (throw (sql-ex "postgres returned a null command tuple count" {:sql sql}))
+
+      (not (string? raw))
+      (throw (sql-ex "postgres returned a malformed command tuple count" {:sql sql}))
+
+      (= raw "") 0
+
+      (not (re-matches #"[0-9]+" raw))
+      (throw (sql-ex "postgres returned a malformed command tuple count" {:sql sql}))
+
+      :else
+      (let [count (try (parse-long raw) (catch Throwable _ nil))]
+        (when-not (and (integer? count) (not (neg? count)))
+          (throw (sql-ex "postgres returned a malformed command tuple count" {:sql sql})))
+        count))))
 
 (defn exec
   "Run a statement and return the number of rows it affected. Commands that do not
   report a count, DDL among them, give 0 — which is what sqlite3_changes reports
   for those too."
-  [conn sql params]
-  (let [res (run conn sql params)
-        n (PQcmdTuples res)]                     ; must be read before PQclear
-    (PQclear res)
-    (or (when n (parse-long n)) 0)))
+  [handle sql params]
+  (with-result handle sql params
+    (fn [result]
+      (if (= PGRES-COMMAND-OK (:status result))
+        (command-count result sql)
+        (throw (sql-ex "postgres tuple result cannot be used as an update count"
+                       {:sql sql}))))))
 
 ;; --- result value normalization ---------------------------------------------
 ;; postgres speaks text on the wire here, so every typed column arrives as a
@@ -380,42 +493,44 @@
         :else                 s))
 
 (defn- read-result
-  "Labels + coerced rows off a PGresult with `ncols` fields (caller clears)."
-  [res ncols]
-  (let [nrows (PQntuples res)
-        labels (mapv (fn [c] (PQfname res c)) (range ncols))
-        oids (mapv (fn [c] (PQftype res c)) (range ncols))
+  "Labels + coerced rows off a validated PGresult (caller clears)."
+  [{:keys [pointer nfields ntuples]}]
+  (let [labels (mapv (fn [c]
+                       (let [label (PQfname pointer c)]
+                         (when-not (string? label)
+                           (throw (sql-ex "postgres returned a null or malformed column name"
+                                          {:column c})))
+                         label))
+                     (range nfields))
+        oids (mapv (fn [c] (PQftype pointer c)) (range nfields))
         rows (mapv (fn [r]
                      (mapv (fn [c]
-                             (when (zero? (PQgetisnull res r c))
-                               (coerce (nth oids c) (PQgetvalue res r c))))
-                           (range ncols)))
-                   (range nrows))]
+                             (when (zero? (PQgetisnull pointer r c))
+                               (coerce (nth oids c) (PQgetvalue pointer r c))))
+                           (range nfields)))
+                   (range ntuples))]
     {:labels labels :rows rows}))
 
 (defn all-raw
   "Run `sql` and return {:labels [col-name ...] :rows [[v ...]]}, keeping column
   order for a caller that reads a row by index. `all` is this with the rows turned
   into maps."
-  [conn sql params]
-  (let [res (run conn sql params)
-        out (read-result res (PQnfields res))]
-    (PQclear res)
-    out))
+  [handle sql params]
+  (with-result handle sql params
+    (fn [result]
+      (if (= PGRES-TUPLES-OK (:status result))
+        (read-result result)
+        {:labels [] :rows []}))))
 
 (defn execute-any
   "Run a statement once; {:labels [...] :rows [[...]] :count n} — rows when the
   result carries fields (SELECT, RETURNING), the affected count otherwise."
-  [conn sql params]
-  (let [res (run conn sql params)
-        ncols (PQnfields res)]
-    (if (pos? ncols)
-      (let [out (read-result res ncols)]
-        (PQclear res)
-        (assoc out :count 0))
-      (let [n (PQcmdTuples res)]
-        (PQclear res)
-        {:labels [] :rows [] :count (or (when (seq n) (parse-long n)) 0)}))))
+  [handle sql params]
+  (with-result handle sql params
+    (fn [result]
+      (if (= PGRES-TUPLES-OK (:status result))
+        (assoc (read-result result) :count 0)
+        {:labels [] :rows [] :count (command-count result sql)}))))
 
 (defn all [conn sql params]
   (let [{:keys [labels rows]} (all-raw conn sql params)
