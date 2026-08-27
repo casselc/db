@@ -3,3 +3,4 @@ build
 *.sqlite3
 jpm_tree/
 .cpcache/
+.jolt/

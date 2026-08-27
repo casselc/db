@@ -4,6 +4,7 @@
   ;; construction at the native drivers. jdbc.core below is the published
   ;; clojure.jdbc running on top of it.
   (:require [db.jdbc]
+            [db.driver-test]
             [next-jdbc-test]
             [jdbc.core :as jdbc]
             ;; the placeholder rewriter lives in the pg driver; requiring it here
@@ -277,6 +278,7 @@
       (jdbc/execute! conn "drop table jolt_payload")
       (jdbc/execute! conn "drop table jolt_person")))
 
+  (db.driver-test/run check)
   (next-jdbc-test/run check)
 
   (if (pos? @failures)

@@ -19,6 +19,7 @@
   rather than to clojure.jdbc, so this namespace only does what it says once that
   file is removed."
   (:require [db.jdbc-shim :as shim]
+            [db.builtin]
             [jdbc.proto :as proto]
             [jdbc.core]))
 

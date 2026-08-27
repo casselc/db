@@ -99,21 +99,35 @@ create `schema_migrations`. Errors raised by the drivers themselves also carry
 ## Layout
 
 - `db.sqlite` / `db.pg` — the native drivers (jolt.ffi bindings).
+- `db.driver` — the explicit driver SPI and deterministic registry.
+- `db.builtin` — SQLite/PostgreSQL adapters registered by the entry point.
 - `db.jdbc-shim` — the `java.sql` surface clojure.jdbc drives, over those drivers.
 - `db.jdbc` — the entry point: loads the shim, then clojure.jdbc on top of it.
 - `jdbc.core` — clojure.jdbc itself, pulled in as a dependency.
 - `next.jdbc` (+ `.sql`/`.prepare`/`.result-set`/`.transaction`) — the next.jdbc
   surface migratus and similar tools use.
 
+## External drivers
+
+An external driver implements `db.driver/Driver` and calls `db.driver/register!`
+when its namespace is explicitly required. The SPI is deliberately narrow:
+open a handle, close it once, and execute one statement once, returning ordered
+labels/rows plus an affected-row count. Transactions and generated keys are
+declared as capabilities and enforced by the shared JDBC shim.
+
+Registry aliases are exact for map specs and URI strings use the longest
+registered prefix. Conflicting aliases or prefixes are rejected. Requiring a
+driver never downloads native code; installers and library loading belong to
+the driver package.
+
 ## Requirements
 
-`jolt` **v0.7.3 or newer** on PATH; the system `libsqlite3` (preinstalled on macOS
+`jolt` **v0.7.23 or newer** on PATH; the system `libsqlite3` (preinstalled on macOS
 and most Linux distros). PostgreSQL support additionally needs `libpq` at runtime.
 
-The version floor is not cosmetic. The shim needs three host fixes that landed in
-v0.7.3: `with-open` on a `reify`, a parenthesised `(Class/FIELD)` reading the
-field, and a protocol extended to a library-declared class actually dispatching.
-On an older jolt this library fails at load or at the first connection.
+The version floor is not cosmetic. In addition to the earlier host-shim fixes,
+the native ownership paths use Jolt's lexically scoped FFI allocation helpers
+and collect-safe blocking calls introduced by v0.7.23.
 
 ## Test
 

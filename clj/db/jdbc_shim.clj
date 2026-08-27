@@ -15,8 +15,12 @@
   implemented; anything else is deliberately absent so a gap shows up as a missing
   method rather than as a silently wrong answer."
   (:require [clojure.string :as str]
-            [db.sqlite :as sqlite]
-            [db.pg :as pg]))
+            [db.driver :as driver]))
+
+;; Driver capability failures are a SQLException subtype on the JVM. Register
+;; that edge in Jolt's modeled class hierarchy before constructing one.
+(jolt.host/register-class-supers! "java.sql.SQLFeatureNotSupportedException"
+                                  ["java.sql.SQLException"])
 
 ;; --- java.sql constants ------------------------------------------------------
 ;; jdbc.constants maps its keyword options onto these, so they have to read as the
@@ -65,6 +69,9 @@
   [msg]
   (throw (jolt.host/throwable "java.sql.SQLException" (str msg))))
 
+(defn- unsupported [msg]
+  (throw (jolt.host/throwable "java.sql.SQLFeatureNotSupportedException" (str msg))))
+
 ;; The drivers report failures as ex-info carrying :jdbc/sql-error. Re-throw those
 ;; as typed SQLExceptions at the shim boundary so clojure.jdbc and its callers see
 ;; the class they expect.
@@ -77,25 +84,25 @@
   `(try ~@body (catch Exception e# (as-sql-error e#))))
 
 ;; --- driver-facing operations ------------------------------------------------
-(defn- vendor [conn] (tget conn :vendor))
+(defn- driver-of [conn] (tget conn :driver))
+(defn- descriptor-of [conn] (tget conn :descriptor))
 (defn- handle [conn] (tget conn :handle))
+
+(defn- run-any [conn sql params]
+  (when (tget conn :closed)
+    (sql-error "connection is closed"))
+  (sql-try (driver/execute-handle (driver-of conn) (handle conn) sql params)))
 
 (defn- run-query
   "Execute `sql` and return {:labels [...] :rows [[v ...]]}."
   [conn sql params]
-  (sql-try
-    (case (vendor conn)
-      :sqlite     (sqlite/query-raw (handle conn) sql params)
-      :postgresql (pg/all-raw (handle conn) sql params))))
+  (let [{:keys [labels rows]} (run-any conn sql params)]
+    {:labels labels :rows rows}))
 
 (defn- run-update
   "Execute `sql` and return the number of rows it affected."
   [conn sql params]
-  (sql-try
-    (case (vendor conn)
-      :sqlite     (do (sqlite/query-raw (handle conn) sql params)
-                      (sqlite/changes (handle conn)))
-      :postgresql (pg/exec (handle conn) sql params))))
+  (:count (run-any conn sql params)))
 
 (defn execute-any
   "Execute `sql` ONCE and report both faces: {:labels [...] :rows [[...]]
@@ -104,15 +111,7 @@
   execute!/execute-one!/plan sit on this, so they never run a statement twice
   to learn which kind it was."
   [conn sql params]
-  (sql-try
-    (case (vendor conn)
-      :sqlite     (let [before (sqlite/total-changes (handle conn))
-                        {:keys [labels rows]} (sqlite/query-raw (handle conn) sql params)]
-                    {:labels labels :rows rows
-                     ;; a total-changes delta, not changes(): changes() reads
-                     ;; stale after DDL (it reports the last DML statement)
-                     :count (if (seq labels) 0 (- (sqlite/total-changes (handle conn)) before))})
-      :postgresql (pg/execute-any (handle conn) sql params))))
+  (run-any conn sql params))
 
 ;; --- java.sql.ResultSetMetaData ----------------------------------------------
 (defn- make-rsmeta [labels]
@@ -199,6 +198,9 @@
                                      (str/join ", " (map name r)))
       :else                     nil)))
 
+(defn- supports-generated-keys? [conn]
+  (= :returning (get-in (descriptor-of conn) [:capabilities :generated-keys])))
+
 (clojure.core/__register-class-methods! :jdbc/prepared
   {"setObject" (fn [self i v] (tput! self :params (assoc (tget self :params) i v)) nil)
    "setString" (fn [self i v] (tput! self :params (assoc (tget self :params) i v)) nil)
@@ -213,11 +215,15 @@
                      (let [conn (tget self :conn)
                            params (param-vec self)]
                        (if-let [rsql (returning-sql self)]
-                         ;; run it as a query so the RETURNING rows can be handed
-                         ;; back from getGeneratedKeys, and report the row count
-                         (let [res (run-query conn rsql params)]
-                           (tput! self :keys res)
-                           (count (:rows res)))
+                         (do
+                           (when-not (supports-generated-keys? conn)
+                             (unsupported (str "generated keys are not supported by "
+                                               (:product-name (descriptor-of conn)))))
+                           ;; run it as a query so the RETURNING rows can be handed
+                           ;; back from getGeneratedKeys, and report the row count
+                           (let [res (run-query conn rsql params)]
+                             (tput! self :keys res)
+                             (count (:rows res))))
                          (do (tput! self :keys nil)
                              (run-update conn (tget self :sql) params)))))
 
@@ -264,20 +270,19 @@
 
 (clojure.core/__register-class-methods! :jdbc/dbmeta
   {"getDatabaseProductName" (fn [self]
-                              (case (vendor (tget self :conn))
-                                :sqlite "SQLite"
-                                :postgresql "PostgreSQL"))
+                              (:product-name (descriptor-of (tget self :conn))))
    "getConnection" (fn [self] (tget self :conn))})
 
 ;; --- java.sql.Connection -----------------------------------------------------
 ;; Transactions go through the same BEGIN / SAVEPOINT sequence the drivers already
 ;; understand. Autocommit off means a transaction is open, so BEGIN is issued on
 ;; the transition rather than eagerly.
-(defn- make-connection [vendor handle close-fn]
+(defn- make-connection [drv descriptor handle]
   (let [t (tt :jdbc/connection)]
-    (tput! t :vendor vendor)
+    (tput! t :vendor (:id descriptor))
+    (tput! t :driver drv)
+    (tput! t :descriptor descriptor)
     (tput! t :handle handle)
-    (tput! t :close-fn close-fn)
     (tput! t :autocommit true)
     (tput! t :readonly false)
     (tput! t :isolation 2)                       ; TRANSACTION_READ_COMMITTED
@@ -286,6 +291,9 @@
     t))
 
 (defn- exec! [conn sql] (run-update conn sql []))
+
+(defn- transaction-mode [conn]
+  (get-in (descriptor-of conn) [:capabilities :transactions]))
 
 (clojure.core/__register-class-methods! :jdbc/connection
   {"createStatement"  (fn [self & _] (make-statement self))
@@ -305,7 +313,10 @@
                        (when (not= v (tget self :autocommit))
                          (if v
                            (when-not (tget self :closed) (exec! self "COMMIT"))
-                           (exec! self "BEGIN"))
+                           (if (= :none (transaction-mode self))
+                             (unsupported (str "transactions are not supported by "
+                                               (:product-name (descriptor-of self))))
+                             (exec! self "BEGIN")))
                          (tput! self :autocommit v))
                        nil))
    "getAutoCommit" (fn [self] (tget self :autocommit))
@@ -316,12 +327,17 @@
               nil)
    "rollback" (fn [self & [sp]]
                 (if sp
-                  (exec! self (str "ROLLBACK TO SAVEPOINT " (tget sp :name)))
+                  (do
+                    (exec! self (str "ROLLBACK TO SAVEPOINT " (tget sp :name)))
+                    (exec! self (str "RELEASE SAVEPOINT " (tget sp :name))))
                   (do (exec! self "ROLLBACK")
                       (when-not (tget self :autocommit) (exec! self "BEGIN"))))
                 nil)
 
    "setSavepoint" (fn [self & [nm]]
+                    (when-not (= :savepoint (transaction-mode self))
+                      (unsupported (str "nested transactions are not supported by "
+                                        (:product-name (descriptor-of self)))))
                     (let [n (count (tget self :savepoints))
                           name (or nm (str "jdbc_sp_" n))
                           sp (tt :jdbc/savepoint)]
@@ -338,16 +354,18 @@
    "setTransactionIsolation" (fn [self v] (tput! self :isolation v) nil)
    "getTransactionIsolation" (fn [self] (tget self :isolation))
    "setSchema" (fn [self s]
-                 (when (and s (= :postgresql (vendor self)))
-                   (exec! self (str "SET search_path TO " s)))
+                 (when-let [schema-sql (and s (:schema-sql (descriptor-of self)))]
+                   (exec! self (schema-sql s)))
                  nil)
 
    "getMetaData" (fn [self] (make-dbmeta self))
    "isClosed" (fn [self] (tget self :closed))
    "close" (fn [self]
              (when-not (tget self :closed)
-               ((tget self :close-fn))
-               (tput! self :closed true))
+               ;; Fail closed: a native close failure must not make a second
+               ;; close retry an already-consumed handle.
+               (tput! self :closed true)
+               (driver/close-handle (driver-of self) (handle self)))
              nil)})
 
 (clojure.core/__register-class-methods! :jdbc/savepoint
@@ -394,59 +412,32 @@
               [c]))))
 
 ;; --- connection construction -------------------------------------------------
-(defn- sqlite-connection [name]
-  (let [h (sqlite/open name)]
-    (sqlite/query-raw h "PRAGMA foreign_keys=1;" [])
-    (make-connection :sqlite h (fn [] (sqlite/close h)))))
 
-(defn- pg-connection [uri]
-  (let [h (pg/connect uri)]
-    (make-connection :postgresql h (fn [] (pg/close h)))))
-
-(defn- pg-uri [{:keys [subname host port user password dbname] :as spec}]
-  (let [;; subname is JDBC's //host:port/db
-        sn (or subname "")
-        sn (if (str/starts-with? sn "//") (subs sn 2) sn)
-        [hostport db] (let [i (str/index-of sn "/")]
-                        (if i [(subs sn 0 i) (subs sn (inc i))] ["" sn]))
-        [db qs] (let [i (str/index-of (or db "") "?")]
-                  (if i [(subs db 0 i) (subs db (inc i))] [db nil]))
-        params (when qs
-                 (into {} (map (fn [kv]
-                                 (let [[k v] (str/split kv #"=" 2)] [k v]))
-                               (str/split qs #"&"))))
-        user (or user (get params "user"))
-        password (or password (get params "password"))]
-    (str "postgres://"
-         (when user (str user (when password (str ":" password)) "@"))
-         (if (str/blank? hostport) (str (or host "127.0.0.1")
-                                        (when port (str ":" port)))
-             hostport)
-         "/" (or (when-not (str/blank? db) db) dbname (:name spec)))))
+(defn driver-context
+  "Driver-extension SPI. Return the registered descriptor and native state for
+  an open shim connection, optionally asserting the expected driver id. Driver
+  libraries use this to implement high-level operations such as chDB streaming
+  inserts without exposing a native pointer as an application API."
+  ([conn] (driver-context conn nil))
+  ([conn expected-id]
+   (when-not (tagged? conn :jdbc/connection)
+     (sql-error "expected a db.jdbc-shim connection"))
+   (when (tget conn :closed)
+     (sql-error "connection is closed"))
+   (let [descriptor (descriptor-of conn)]
+     (when (and expected-id (not= expected-id (:id descriptor)))
+       (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
+     {:driver (driver-of conn) :descriptor descriptor :handle (handle conn)})))
 
 (defn connection
   "Open a java.sql.Connection shim for a clojure.jdbc dbspec. Recognises the
   classic :subprotocol/:subname form, the pretty :vendor/:name form, and a uri
   string; anything else is not a spec this library can serve."
   [spec]
-  (cond
-    (tagged? spec :jdbc/connection) spec
-
-    (string? spec)
-    (let [s spec]
-      (cond
-        (str/starts-with? s "postgres") (pg-connection s)
-        (str/starts-with? s "sqlite:")  (sqlite-connection (subs s 7))
-        :else                           (sqlite-connection s)))
-
-    (map? spec)
-    (let [v (or (:subprotocol spec) (:vendor spec))
-          v (str/lower-case (str v))]
-      (cond
-        (contains? #{"postgresql" "postgres" "pgsql"} v) (pg-connection (pg-uri spec))
-        (contains? #{"sqlite" "sqlite3"} v)
-        (sqlite-connection (let [n (or (:subname spec) (:name spec))]
-                             (if (str/starts-with? (str n) "//") (subs (str n) 2) (str n))))
-        :else (sql-error (str "unsupported vendor for this driver: " v))))
-
-    :else (sql-error (str "invalid dbspec: " (pr-str spec)))))
+  (if (tagged? spec :jdbc/connection)
+    spec
+    (sql-try
+      (let [drv (driver/resolve-driver spec)
+            descriptor (driver/driver-descriptor drv)
+            h (driver/open-handle drv spec)]
+        (make-connection drv descriptor h)))))

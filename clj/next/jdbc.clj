@@ -24,12 +24,6 @@
             [db.datasource :as ds]
             [clojure.string :as str]))
 
-(defn- product-name [vendor]
-  (case vendor
-    :sqlite "SQLite"
-    :postgresql "PostgreSQL"
-    (str vendor)))
-
 (defn- normalize-spec
   "Map a next.jdbc-style db-spec onto what jdbc.core/connection accepts (a uri
   string or a {:vendor :name ...} map). Passes through strings and specs that
@@ -88,7 +82,8 @@
         shim-conn (proto/connection raw)]
     (jolt.host/ref-put! t :raw raw)
     (jolt.host/ref-put! t :close (fn [] (.close raw)))
-    (jolt.host/ref-put! t :product (product-name (jolt.host/ref-get shim-conn :vendor)))
+    (jolt.host/ref-put! t :product
+                        (.getDatabaseProductName (.getMetaData shim-conn)))
     t))
 
 (defn- shim-of
