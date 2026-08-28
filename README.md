@@ -170,7 +170,8 @@ Encoded query export is an optional extension rather than another mandatory
 `db.export/query-bytes` accepts a SQL string or JDBC/HoneySQL vector plus the
 closed option set `:format`, `:max-rows`, and `:max-bytes`. It returns an owned
 `{:format :content-type :extension :byte-count :bytes}` map. The shared boundary
-validates capability metadata, limits, positional parameters, and result shape
+validates capability metadata and limits, normalizes positional parameters, and
+validates result shape
 before allowing a driver to contradict its descriptor. Media types and short
 filename extensions are header-safe tokens, and successful results contain
 exactly those five public keys; native pointers and private driver fields are
