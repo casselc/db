@@ -4,6 +4,7 @@
   ;; construction at the native drivers. jdbc.core below is the published
   ;; clojure.jdbc running on top of it.
   (:require [db.jdbc]
+            [db.aspect-manifest-test]
             [db.driver-test]
             [db.export-test]
             [db.driver-hegel-test]
@@ -281,6 +282,7 @@
       (jdbc/execute! conn "drop table jolt_payload")
       (jdbc/execute! conn "drop table jolt_person")))
 
+  (db.aspect-manifest-test/run check)
   (db.driver-test/run check)
   (db.export-test/run check)
   (db.driver-hegel-test/run check)

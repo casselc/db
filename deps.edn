@@ -1,4 +1,4 @@
-{:paths ["clj"]
+{:paths ["clj" "resources"]
 
  ;; clojure.jdbc is the API this library exposes: the published library running on
  ;; the java.sql shim in db.jdbc-shim, rather than a reimplementation of it here.
