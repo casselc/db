@@ -88,6 +88,23 @@
 (defmacro ^:private sql-try [& body]
   `(try ~@body (catch Exception e# (as-sql-error e#))))
 
+(defn extension-operation
+  "Run one complete public driver-extension operation at the JDBC boundary.
+
+  Existing SQLExceptions retain their identity. Every other Exception becomes
+  a SQLException whose cause is the original value, preserving precise ex-data
+  for callers that need structured diagnostics. The supplied function should
+  include connection conversion, driver-context preflight, invocation, and
+  public result conversion."
+  [operation]
+  (try
+    (operation)
+    (catch java.sql.SQLException error
+      (throw error))
+    (catch Exception error
+      (sql-error (or (ex-message error) "driver extension operation failed")
+                 error))))
+
 ;; --- driver-facing operations ------------------------------------------------
 (defn- driver-of [conn] (tget conn :driver))
 (defn- descriptor-of [conn] (tget conn :descriptor))
@@ -591,22 +608,48 @@
   "Driver-extension SPI. Return the registered descriptor and native state for
   an open shim connection, optionally asserting the expected driver id. Driver
   libraries use this to implement high-level operations such as chDB streaming
-  inserts without exposing a native pointer as an application API."
+  inserts without exposing a native pointer as an application API.
+
+  The optional requirements map accepts only `:capability` and `:preflight`.
+  Both are checked before a deferred transaction is started. `:preflight`
+  receives the context map and may validate an optional driver protocol or
+  operation options before BEGIN or execute-handle work."
   ([conn] (driver-context conn nil))
-  ([conn expected-id]
-   (when-not (tagged? conn :jdbc/connection)
-     (sql-error "expected a db.jdbc-shim connection"))
-   (when (tget conn :closed)
-     (sql-error "connection is closed"))
-   (let [descriptor (descriptor-of conn)]
-     (when (and expected-id (not= expected-id (:id descriptor)))
-       (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
-     ;; Driver-specific operations (DuckDB Appender, chDB streaming, etc.) bypass
-     ;; execute-handle, so crossing this extension seam must materialize the same
-     ;; deferred BEGIN/settings as an ordinary SQL statement. Validate identity
-     ;; first so a wrong-driver request has no transaction side effect.
-     (sql-try (ensure-transaction-started! conn))
-     {:driver (driver-of conn) :descriptor descriptor :handle (handle conn)})))
+  ([conn expected-id] (driver-context conn expected-id nil))
+  ([conn expected-id requirements]
+   (when-not (or (nil? requirements) (map? requirements))
+     (sql-error "driver extension requirements must be a map"))
+   (when-let [unknown (seq (remove #{:capability :preflight}
+                                   (keys requirements)))]
+     (sql-error (str "unsupported driver extension requirements: "
+                     (pr-str (vec (sort-by str unknown))))))
+   (when (and (contains? requirements :capability)
+              (not (keyword? (:capability requirements))))
+     (sql-error "driver extension :capability must be a keyword"))
+   (when (and (contains? requirements :preflight)
+              (not (ifn? (:preflight requirements))))
+     (sql-error "driver extension :preflight must be callable"))
+   (let [{:keys [capability preflight]} requirements]
+     (when-not (tagged? conn :jdbc/connection)
+       (sql-error "expected a db.jdbc-shim connection"))
+     (when (tget conn :closed)
+       (sql-error "connection is closed"))
+     (let [descriptor (descriptor-of conn)]
+       (when (and expected-id (not= expected-id (:id descriptor)))
+         (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
+       (when (and capability
+                  (not (contains? (:capabilities descriptor) capability)))
+         (unsupported
+          (str (:product-name descriptor) " does not support " (name capability))))
+       (let [context {:driver (driver-of conn)
+                      :descriptor descriptor
+                      :handle (handle conn)}]
+         (when preflight (preflight context))
+         ;; Driver-specific operations bypass execute-handle, so crossing this
+         ;; seam materializes the same deferred BEGIN/settings as ordinary SQL.
+         ;; Identity and requirements reject before that BEGIN/execute work.
+         (sql-try (ensure-transaction-started! conn))
+         context)))))
 
 (defn connection
   "Open a java.sql.Connection shim for a clojure.jdbc dbspec. Recognises the

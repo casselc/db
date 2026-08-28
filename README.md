@@ -152,6 +152,39 @@ registered prefix. Conflicting aliases or prefixes are rejected. Requiring a
 driver never downloads native code; installers and library loading belong to
 the driver package.
 
+Encoded query export is an optional extension rather than another mandatory
+`db.driver/Driver` method. A supporting driver implements
+`db.export/QueryBytesDriver` and advertises the same contract in its descriptor:
+
+```clojure
+{:capabilities
+ {:query-bytes
+  {:version 1
+   :formats {:arrow {:content-type "application/vnd.apache.arrow.file"
+                     :extension "arrow"}}
+   :limits {:max-rows 100000 :max-bytes 67108864
+            :default-max-rows 100000 :default-max-bytes 67108864}
+   :staging :memory}}}
+```
+
+`db.export/query-bytes` accepts a SQL string or JDBC/HoneySQL vector plus the
+closed option set `:format`, `:max-rows`, and `:max-bytes`. It returns an owned
+`{:format :content-type :extension :byte-count :bytes}` map. The shared boundary
+validates capability metadata, limits, positional parameters, and result shape
+before allowing a driver to contradict its descriptor. Media types and short
+filename extensions are header-safe tokens, and successful results contain
+exactly those five public keys; native pointers and private driver fields are
+rejected. Public operation failures are SQLExceptions whose cause retains the
+original structured ex-data. Drivers retain the
+engine-specific responsibilities: accepting only a safe query shape, enforcing
+the row cap, serializing under their connection lock, cleaning native or private
+staging resources, and copying bytes before those resources are released.
+
+The public operation accepts no output path and rejects limits rather than
+truncating results. A non-memory implementation must disclose its staging mode
+in the descriptor (for example `:private-temp-file`) so applications can apply
+their own filesystem policy.
+
 ## Requirements
 
 `jolt` **v0.7.23 or newer** on PATH; the system `libsqlite3` (preinstalled on macOS

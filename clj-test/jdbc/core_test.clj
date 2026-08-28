@@ -5,6 +5,7 @@
   ;; clojure.jdbc running on top of it.
   (:require [db.jdbc]
             [db.driver-test]
+            [db.export-test]
             [db.driver-hegel-test]
             [db.pg-test]
             [next-jdbc-test]
@@ -281,6 +282,7 @@
       (jdbc/execute! conn "drop table jolt_person")))
 
   (db.driver-test/run check)
+  (db.export-test/run check)
   (db.driver-hegel-test/run check)
   (db.pg-test/run check)
   (next-jdbc-test/run check)
