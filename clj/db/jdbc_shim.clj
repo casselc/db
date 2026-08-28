@@ -109,6 +109,8 @@
 (defn- driver-of [conn] (tget conn :driver))
 (defn- descriptor-of [conn] (tget conn :descriptor))
 (defn- handle [conn] (tget conn :handle))
+(defn- connection-closed? [conn]
+  (boolean @(tget conn :close-claimed?)))
 
 (defn- invalid-result! [conn message data]
   (throw (ex-info message
@@ -212,7 +214,7 @@
         (throw t)))))
 
 (defn- run-any [conn sql params]
-  (when (tget conn :closed)
+  (when (connection-closed? conn)
     (sql-error "connection is closed"))
   (sql-try
     (ensure-transaction-started! conn)
@@ -418,6 +420,11 @@
     (tput! t :transaction-setting-baseline nil)
     (tput! t :savepoints [])
     (tput! t :closed false)
+    ;; The connection layer owns the one call into Driver/close-handle. Keep the
+    ;; claim here rather than asking every driver to compensate for concurrent
+    ;; or repeated Closeable clients. Driver handles may still defend their own
+    ;; native resource as a final safety boundary.
+    (tput! t :close-claimed? (atom false))
     t))
 
 (defn- exec! [conn sql] (:count (driver-execute! conn sql [])))
@@ -473,7 +480,7 @@
                        (when (not= v (tget self :autocommit))
                          (if v
                            (do
-                             (when (and (not (tget self :closed))
+                             (when (and (not (connection-closed? self))
                                         (tget self :tx-active))
                                (exec! self "COMMIT"))
                              (tput! self :tx-active false)
@@ -550,9 +557,9 @@
                  nil)
 
    "getMetaData" (fn [self] (make-dbmeta self))
-   "isClosed" (fn [self] (tget self :closed))
+   "isClosed" (fn [self] (connection-closed? self))
    "close" (fn [self]
-             (when-not (tget self :closed)
+             (when (compare-and-set! (tget self :close-claimed?) false true)
                ;; Fail closed: a native close failure must not make a second
                ;; close retry an already-consumed handle.
                (tput! self :closed true)
@@ -632,7 +639,7 @@
    (let [{:keys [capability preflight]} requirements]
      (when-not (tagged? conn :jdbc/connection)
        (sql-error "expected a db.jdbc-shim connection"))
-     (when (tget conn :closed)
+     (when (connection-closed? conn)
        (sql-error "connection is closed"))
      (let [descriptor (descriptor-of conn)]
        (when (and expected-id (not= expected-id (:id descriptor)))

@@ -143,6 +143,7 @@
   (println "next.jdbc db-spec normalization")
   (let [opens (atom [])
         closes (atom 0)
+        fail-close? (atom false)
         recording
         (reify driver/Driver
           (descriptor [_]
@@ -156,6 +157,8 @@
             {:spec spec})
           (close-handle [_ _]
             (swap! closes inc)
+            (when @fail-close?
+              (throw (ex-info "injected remote close failure" {})))
             nil)
           (execute-handle [_ _ _ _]
             {:labels [] :rows [] :count 0}))
@@ -174,11 +177,28 @@
       (driver/register! recording)
       (let [conn (nj/get-connection remote-spec)] (.close conn))
       (let [conn (nj/get-connection uri)] (.close conn))
+      (let [conn (nj/get-connection remote-spec)
+            start (promise)
+            closers (mapv (fn [_] (future @start (.close conn))) (range 8))]
+        (deliver start true)
+        (doseq [closer closers] @closer)
+        (.close conn)
+        (check "concurrent next.jdbc close marks the wrapper closed"
+               true (.isClosed conn)))
+      (let [conn (nj/get-connection remote-spec)]
+        (reset! fail-close? true)
+        (check "remote close failure reaches its caller" :threw
+               (try (.close conn) :returned (catch Throwable _ :threw)))
+        (check "failed native close still marks the wrapper closed"
+               true (.isClosed conn))
+        (check "repeated close cannot retry a consumed native handle" nil
+               (.close conn))
+        (reset! fail-close? false))
       (check ":dbtype preserves the complete remote driver spec"
              normalized (first @opens))
       (check "URI/string specs still reach the driver unchanged"
              uri (second @opens))
-      (check "recording connections retain normal close ownership" 2 @closes)
+      (check "recording connections retain exactly-once close ownership" 4 @closes)
       (finally
         (driver/unregister! :recording-remote))))
 

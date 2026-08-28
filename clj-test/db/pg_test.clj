@@ -288,6 +288,50 @@
       (finally
         (ffi/free conn))))
 
+  ;; Exercise every allocation boundary in one mixed-parameter invocation:
+  ;; four fixed arrays, a text value, a bytea value, and the rewritten SQL.
+  ;; Each injected failure must unwind everything allocated before it and must
+  ;; never enter libpq with an incompletely constructed argument set.
+  (doseq [fail-at (range 1 8)]
+    (let [conn (ffi/alloc 1)
+          handle (fake-handle conn)
+          real-alloc ffi/alloc
+          real-string ffi/string->ptr
+          real-free ffi/free
+          calls (atom 0)
+          execs (atom 0)
+          live (atom #{})
+          allocate-or-throw
+          (fn [allocate value]
+            (let [call (swap! calls inc)]
+              (when (= call fail-at)
+                (throw (ex-info "injected postgres allocation failure"
+                                {:allocation call})))
+              (let [pointer (allocate value)]
+                (swap! live conj pointer)
+                pointer)))]
+      (try
+        (with-redefs [ffi/alloc (fn [size] (allocate-or-throw real-alloc size))
+                      ffi/string->ptr (fn [value]
+                                        (allocate-or-throw real-string value))
+                      ffi/free (fn [pointer]
+                                 (swap! live disj pointer)
+                                 (real-free pointer))
+                      pg/PQexecParams (fn [& _]
+                                        (swap! execs inc)
+                                        (throw (ex-info "unexpected native exec" {})))]
+          (let [error (throws #(pg/execute-any
+                                handle "select ?, ?"
+                                ["text" (byte-array [0 -1])]))]
+            (check (str "allocation failure " fail-at " is observed")
+                   fail-at (:allocation (ex-data error)))
+            (check (str "allocation failure " fail-at " frees prior ownership")
+                   #{} @live)
+            (check (str "allocation failure " fail-at " never enters libpq")
+                   0 @execs)))
+        (finally
+          (ffi/free conn)))))
+
   (let [conn (ffi/alloc 1)
         result (ffi/alloc 1)
         clears (atom 0)
@@ -369,6 +413,39 @@
           (check "serialized close eventually reaches PQfinish" true @native-finished)))
       (finally
         (deliver release-operation true)
+        (ffi/free conn))))
+
+  (let [conn (ffi/alloc 1)
+        handle (fake-handle conn)
+        start (promise)
+        finish-entered (promise)
+        release-finish (promise)
+        finishes (atom 0)]
+    (try
+      (with-redefs [pg/PQfinish
+                    (fn [_]
+                      (swap! finishes inc)
+                      (deliver finish-entered true)
+                      @release-finish
+                      nil)]
+        (let [closers (mapv (fn [_]
+                              (future @start (pg/close handle)))
+                            (range 8))]
+          (deliver start true)
+          (check "one concurrent close reaches PQfinish" true
+                 (deref finish-entered 1000 false))
+          (check "other concurrent closes cannot enter PQfinish" 1 @finishes)
+          (deliver release-finish true)
+          (doseq [closer closers] @closer)
+          (check "concurrent and repeated postgres close is exactly once"
+                 1 @finishes)
+          (check "concurrently closed postgres handle rejects use"
+                 true
+                 (:db.pg/closed
+                  (ex-data (throws #(pg/with-live-handle handle identity)))))))
+      (finally
+        (deliver start true)
+        (deliver release-finish true)
         (ffi/free conn))))
 
   (let [result (property/run-property!)]

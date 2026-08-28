@@ -51,10 +51,11 @@
   {"setAutoCommit" (fn [_ _] nil)
    "commit"        (fn [_] nil)
    "rollback"      (fn [_] nil)
-   "isClosed"      (fn [self] (boolean (jolt.host/ref-get self :closed)))
+   ;; The raw JDBC connection owns the close claim. Every wrapper close may
+   ;; delegate safely; the raw layer chooses the one Driver/close-handle caller.
+   "isClosed"      (fn [self] (.isClosed (jolt.host/ref-get self :shim)))
    "close"         (fn [self]
-                     (when-let [c (jolt.host/ref-get self :close)] (c))
-                     (jolt.host/ref-put! self :closed true) nil)
+                     (when-let [c (jolt.host/ref-get self :close)] (c)))
    "getMetaData"   (fn [self]
                      (let [m (jolt.host/tagged-table meta-tag)]
                        (jolt.host/ref-put! m :product (jolt.host/ref-get self :product))
@@ -85,6 +86,7 @@
   (let [t (jolt.host/tagged-table conn-tag)
         shim-conn (proto/connection raw)]
     (jolt.host/ref-put! t :raw raw)
+    (jolt.host/ref-put! t :shim shim-conn)
     (jolt.host/ref-put! t :close (fn [] (.close raw)))
     (jolt.host/ref-put! t :product
                         (.getDatabaseProductName (.getMetaData shim-conn)))

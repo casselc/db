@@ -302,50 +302,76 @@
 (defn- string-pointer! [owned value]
   (own! owned (ffi/string->ptr value)))
 
-(defn- param-arrays
-  "Build PQexecParams' type / value / length / format arrays for `params`.
-  Every non-null pointer is registered in `owned` immediately; the surrounding
-  query scope frees that registry on success or failure."
-  [params owned]
+(defn- fill-param-arrays!
+  "Populate four caller-owned PQexecParams arrays. Only the dynamically many
+  value buffers need the small ownership registry: the four fixed arrays are
+  scoped by call-with-param-arrays below."
+  [params owned types values lengths formats]
+  (let [n (count params)
+        ps (ffi/sizeof :pointer)
+        is (ffi/sizeof :int)
+        os (ffi/sizeof :uint)
+        ;; a NULL value pointer is how libpq reads a SQL NULL, so an empty byte
+        ;; array still needs a pointer of its own to stay distinct from nil.
+        cells (mapv (fn [v]
+                      (cond
+                        (nil? v)   [INFER-OID ffi/null 0 TEXT-FORMAT]
+                        (bytes? v) (let [len (alength v)
+                                         p (allocate! owned (max 1 len))]
+                                     (ffi/write-array p v)
+                                     [bytea-oid p len BINARY-FORMAT])
+                        (sequential? v) [INFER-OID (string-pointer! owned (pg-array-literal v)) 0 TEXT-FORMAT]
+                        :else      [INFER-OID (string-pointer! owned (str v)) 0 TEXT-FORMAT]))
+                    params)]
+    (dotimes [i n]
+      (let [[oid p len fmt] (nth cells i)]
+        (ffi/write types   :uint    (* i os) oid)
+        (ffi/write values  :pointer (* i ps) p)
+        (ffi/write lengths :int     (* i is) len)
+        (ffi/write formats :int     (* i is) fmt)))))
+
+(defn- call-with-param-arrays
+  "Call f while every PQexecParams array and value buffer is live. Jolt v0.7.28
+  supplies lexical helpers for the four statically nested arrays. Its dynamic
+  allocation arena is newer, so value buffers retain an explicit reverse-order
+  registry until that newer Jolt is selected."
+  [params f]
   (let [n (count params)]
     (if (zero? n)
-      [ffi/null ffi/null ffi/null ffi/null]
+      (f ffi/null ffi/null ffi/null ffi/null)
       (let [ps (ffi/sizeof :pointer)
             is (ffi/sizeof :int)
-            os (ffi/sizeof :uint)
-            types   (allocate! owned (* n os))
-            values  (allocate! owned (* n ps))
-            lengths (allocate! owned (* n is))
-            formats (allocate! owned (* n is))
-            ;; a NULL value pointer is how libpq reads a SQL NULL, so an empty
-            ;; byte array still needs a pointer of its own to stay distinct from
-            ;; nil — hence the 1-byte floor on a 0-length payload.
-            cells (mapv (fn [v]
-                          (cond
-                            (nil? v)   [INFER-OID ffi/null 0 TEXT-FORMAT]
-                            (bytes? v) (let [len (alength v)
-                                             p (allocate! owned (max 1 len))]
-                                         (ffi/write-array p v)
-                                         [bytea-oid p len BINARY-FORMAT])
-                            (sequential? v) [INFER-OID (string-pointer! owned (pg-array-literal v)) 0 TEXT-FORMAT]
-                            :else      [INFER-OID (string-pointer! owned (str v)) 0 TEXT-FORMAT]))
-                        params)]
-        (dotimes [i n]
-          (let [[oid p len fmt] (nth cells i)]
-            (ffi/write types   :uint    (* i os) oid)
-            (ffi/write values  :pointer (* i ps) p)
-            (ffi/write lengths :int     (* i is) len)
-            (ffi/write formats :int     (* i is) fmt)))
-        [types values lengths formats]))))
+            os (ffi/sizeof :uint)]
+        (ffi/with-alloc [types (* n os)]
+          (when (ffi/null? types)
+            (throw (sql-ex "postgres parameter type array allocation returned null" {})))
+          (ffi/with-alloc [values (* n ps)]
+            (when (ffi/null? values)
+              (throw (sql-ex "postgres parameter value array allocation returned null" {})))
+            (ffi/with-alloc [lengths (* n is)]
+              (when (ffi/null? lengths)
+                (throw (sql-ex "postgres parameter length array allocation returned null" {})))
+              (ffi/with-alloc [formats (* n is)]
+                (when (ffi/null? formats)
+                  (throw (sql-ex "postgres parameter format array allocation returned null" {})))
+                (let [owned (atom [])]
+                  (try
+                    (fill-param-arrays! params owned types values lengths formats)
+                    (f types values lengths formats)
+                    (finally
+                      (doseq [pointer (reverse @owned)]
+                        (ffi/free pointer)))))))))))))
 
 (defn- run-result [conn sql params]
-  (let [owned (atom [])]
-    (try
-      (let [[types values lengths formats] (param-arrays params owned)
-            rewritten (pg-placeholders sql)
+  (call-with-param-arrays
+   params
+   (fn [types values lengths formats]
+     (let [rewritten (pg-placeholders sql)
             ;; Collect-safe FFI cannot accept a Scheme string argument, so keep
             ;; the rewritten query in a scoped C buffer for the blocking call.
             res (ffi/with-c-string [sql-ptr rewritten]
+                  (when (ffi/null? sql-ptr)
+                    (throw (sql-ex "postgres query allocation returned null" {:sql sql})))
                   (PQexecParams conn sql-ptr (count params)
                                 types values lengths formats 0))]
         (when (ffi/null? res)
@@ -381,10 +407,7 @@
               ;; this scope owns every non-null PGresult, including when status
               ;; or error-message inspection throws.
               (when-not @transferred?
-                (PQclear res))))))
-      (finally
-        (doseq [pointer (reverse @owned)]
-          (ffi/free pointer))))))
+                (PQclear res)))))))))
 
 (defn- with-result [handle sql params f]
   (with-live-handle
