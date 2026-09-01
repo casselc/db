@@ -284,10 +284,10 @@
                         params)]
         (dotimes [i n]
           (let [[oid p len fmt] (nth cells i)]
-            (ffi/write types   :uint    (* i os) oid)
-            (ffi/write values  :pointer (* i ps) p)
-            (ffi/write lengths :int     (* i is) len)
-            (ffi/write formats :int     (* i is) fmt)))
+            (ffi/write types :uint oid (* i os))
+            (ffi/write values :pointer p (* i ps))
+            (ffi/write lengths :int len (* i is))
+            (ffi/write formats :int fmt (* i is))))
         [types values lengths formats
          (into [types values lengths formats]
                (remove (fn [p] (ffi/null? p)) (mapv second cells)))]))))
