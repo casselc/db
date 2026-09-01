@@ -4,7 +4,8 @@
             [db.jdbc-shim :as shim]
             [db.sqlite :as sqlite]
             [jdbc.core :as jdbc]
-            [jdbc.proto :as proto]))
+            [jdbc.proto :as proto]
+            [jolt.ffi :as ffi]))
 
 (defn- fake-driver [desc calls]
   (reify driver/Driver
@@ -57,6 +58,25 @@
 
 (defn- sqlite-ownership-checks [check]
   (println "sqlite native ownership")
+  (let [real-open sqlite/sqlite3-open
+        initial-holder (atom ::unset)
+        published-holder? (atom false)]
+    (with-redefs [sqlite/sqlite3-open
+                  (fn [path holder]
+                    (reset! initial-holder (ffi/read holder :pointer))
+                    (let [rc (real-open path holder)]
+                      (reset! published-holder?
+                              (not (ffi/null? (ffi/read holder :pointer))))
+                      rc))]
+      (let [h (sqlite/open ":memory:")]
+        (try
+          (check "sqlite open initializes its native output holder at offset zero"
+                 true (ffi/null? @initial-holder))
+          (check "sqlite native open publishes its handle through that holder"
+                 true @published-holder?)
+          (finally
+            (sqlite/close h))))))
+
   (let [h (sqlite/open ":memory:")
         real-close sqlite/sqlite3-close-v2
         closes (atom 0)]

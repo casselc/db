@@ -1,5 +1,7 @@
 {:paths ["clj" "resources"]
 
+ :jolt/min-version "0.8.0"
+
  ;; clojure.jdbc is the API this library exposes: the published library running on
  ;; the java.sql shim in db.jdbc-shim, rather than a reimplementation of it here.
  ;; Require db.jdbc once before jdbc.core so the shim is registered first.
@@ -28,7 +30,7 @@
  :aliases {:test {:extra-paths ["clj-test"]
                   :extra-deps {io.github.chucklehead-dev/jolt-hegel
                                {:git/url "https://github.com/chucklehead-dev/jolt-hegel.git"
-                                :git/sha "53631c81cd927175935037699ddf687d98a44d24"}}
+                                :git/sha "bcc4d8da54f51d79044d9ad6bcfb09049f9ac27e"}}
                   :main-opts ["-m" "jdbc.core-test"]}}
 
  :tasks {test "jolt -M:test"}}

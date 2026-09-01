@@ -188,12 +188,12 @@ their own filesystem policy.
 
 ## Requirements
 
-`jolt` **v0.7.23 or newer** on PATH; the system `libsqlite3` (preinstalled on macOS
+`jolt` **v0.8.0 or newer** on PATH; the system `libsqlite3` (preinstalled on macOS
 and most Linux distros). PostgreSQL support additionally needs `libpq` at runtime.
 
 The version floor is not cosmetic. In addition to the earlier host-shim fixes,
-the native ownership paths use Jolt's lexically scoped FFI allocation helpers
-and collect-safe blocking calls introduced by v0.7.23.
+the native ownership paths use Jolt's lexically scoped FFI allocation helpers,
+collect-safe blocking calls, and value-first scalar writes.
 
 ## Test
 
