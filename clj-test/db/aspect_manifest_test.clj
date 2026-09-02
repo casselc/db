@@ -11,9 +11,10 @@
              :version "a55c554a66d8f5e9e5198e238773f8218f6050d7"}
    :aspects
    [{:id :db.jdbc-shim/execute
-     :match {:ns 'db.jdbc-shim
+     :match {:arity 4
              :call 'db.driver/execute-handle
-             :arity 4}
+             :marker :db.jdbc-shim/execute
+             :ns 'db.jdbc-shim}
      :advice-role :db/client
      :expect {:matches 1}}]})
 

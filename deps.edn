@@ -2,6 +2,12 @@
 
  :jolt/min-version "0.8.0"
 
+ :jolt/aspects
+ {:library {:id jolt-lang/db
+            :version "a55c554a66d8f5e9e5198e238773f8218f6050d7"}
+  :namespaces [db.jdbc-shim]
+  :manifest "resources/META-INF/jolt/aspects/db-jdbc-shim.edn"}
+
  ;; clojure.jdbc is the API this library exposes: the published library running on
  ;; the java.sql shim in db.jdbc-shim, rather than a reimplementation of it here.
  ;; Require db.jdbc once before jdbc.core so the shim is registered first.

@@ -15,7 +15,8 @@
   implemented; anything else is deliberately absent so a gap shows up as a missing
   method rather than as a silently wrong answer."
   (:require [clojure.string :as str]
-            [db.driver :as driver]))
+            [db.driver :as driver]
+            [jolt.aspects :as aspects]))
 
 ;; Driver capability failures are a SQLException subtype on the JVM. Register
 ;; that edge in Jolt's modeled class hierarchy before constructing one.
@@ -153,7 +154,9 @@
 
 (defn- driver-execute! [conn sql params]
   (validate-result conn
-                   (driver/execute-handle (driver-of conn) (handle conn) sql params)))
+                   (aspects/at {:id :db.jdbc-shim/execute :role :db/client}
+                     (driver/execute-handle
+                      (driver-of conn) (handle conn) sql params))))
 
 (defn- setting-entry [conn setting value]
   (get-in (descriptor-of conn) [:transaction-settings setting value]))
