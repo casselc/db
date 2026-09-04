@@ -20,10 +20,16 @@
   (println "library-owned database aspect contract")
   (let [resource (io/resource resource-name)
         text (some-> resource slurp)
-        manifest (some-> text edn/read-string)]
+        manifest (some-> text edn/read-string)
+        annotated-var (ns-resolve 'db.jdbc-shim
+                                  'observed-driver-execute-handle)
+        annotation (meta annotated-var)]
     (check "aspect manifest is packaged as a classpath resource"
            true (some? resource))
     (check "aspect manifest has the exact inert schema and compatibility id"
            expected-manifest manifest)
     (check "aspect manifest carries no telemetry implementation"
-           false (and text (.contains (.toLowerCase text) "otel")))))
+           false (and text (.contains (.toLowerCase text) "otel")))
+    (check "manifest arity matches the live annotated function"
+           (get-in manifest [:aspects 0 :match :arity])
+           (count (first (:arglists annotation))))))
