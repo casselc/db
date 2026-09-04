@@ -12,9 +12,7 @@
    :aspects
    [{:id :db.jdbc-shim/execute
      :match {:arity 4
-             :call 'db.driver/execute-handle
-             :marker :db.jdbc-shim/execute
-             :ns 'db.jdbc-shim}
+             :entry 'db.jdbc-shim/observed-driver-execute-handle}
      :advice-role :db/client
      :expect {:matches 1}}]})
 
