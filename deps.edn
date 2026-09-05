@@ -1,6 +1,9 @@
-{:paths ["clj" "resources"]
-
+{;; jolt.ffi/write takes the value BEFORE the offset as of jolt 0.8.0, and the
+ ;; two spellings are both integers — an older runtime writes to the wrong
+ ;; place rather than failing. Declare the floor so it refuses instead.
  :jolt/min-version "0.8.0"
+
+ :paths ["clj" "resources"]
 
  ;; clojure.jdbc is the API this library exposes: the published library running on
  ;; the java.sql shim in db.jdbc-shim, rather than a reimplementation of it here.
@@ -9,10 +12,15 @@
  ;; jolt-lang/time is needed even though nothing here asks for java.time:
  ;; jdbc.util/lower-case calls (Locale/US), which that library provides rather
  ;; than jolt core (RFC 0008), and it sits in the path of every insert.
+ ;; Upstream 91cef5b (v0.0.8) carries the :jolt/provides declaration that the
+ ;; chucklehead-dev/time fork 2494b21 was cut for; the two trees have identical
+ ;; src and the fork's only extra is a java.time.zone.ZoneRules provider entry
+ ;; nothing here references. Pinning upstream keeps one time candidate on the
+ ;; path of every consumer that also pins jolt-lang/time itself.
  :deps {io.github.yogthos/clojure.jdbc {:git/url "https://github.com/yogthos/clojure.jdbc.git"
                                         :git/sha "9fc25d66492164ce204960d6d7b1531e194e2193"}
-        jolt-lang/time {:git/url "https://github.com/chucklehead-dev/time.git"
-                        :git/sha "2494b21b25cd959573c3e6050cd475e4bf302fdb"}}
+        jolt-lang/time {:git/url "https://github.com/jolt-lang/time.git"
+                        :git/sha "91cef5b692c624806ea92ba280200162314cdb52"}}
 
  ;; SQLite (libsqlite3) and PostgreSQL (libpq) are bound natively via jolt.ffi
  ;; (db.sqlite / db.pg). The shared libraries are declared below; jolt loads them
