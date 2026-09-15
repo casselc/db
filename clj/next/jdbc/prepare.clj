@@ -7,6 +7,14 @@
 
 (def ^:private stmt-tag :next.jdbc/statement)
 
+(defn- batch-failure [error]
+  ;; Jolt does not yet model BatchUpdateException's partial update counts; see
+  ;; chucklehead-dev/jolt-aspect-packs#131. It does preserve the typed class and
+  ;; original driver failure as the cause.
+  (jolt.host/throwable "java.sql.BatchUpdateException"
+                       (str (ex-message error))
+                       error))
+
 (clojure.core/__register-class-methods! stmt-tag
   {"addBatch"     (fn [self sql]
                     (jolt.host/ref-put! self :batch
@@ -19,9 +27,12 @@
                     (let [conn (jolt.host/ref-get self :conn)
                           sqls (or (jolt.host/ref-get self :batch) [])
                           res  (mapv (fn [s]
-                                       (let [r (njdbc/execute! conn s)]
-                                         (or (:next.jdbc/update-count (first r))
-                                             (count r))))
+                                       (try
+                                         (let [r (njdbc/execute! conn s)]
+                                           (or (:next.jdbc/update-count (first r))
+                                               (count r)))
+                                         (catch Exception error
+                                           (throw (batch-failure error)))))
                                      sqls)]
                       (jolt.host/ref-put! self :batch [])
                       res))

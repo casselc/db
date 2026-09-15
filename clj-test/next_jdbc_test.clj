@@ -5,9 +5,19 @@
   (:require [jdbc.core :as jc]
             [jdbc.proto :as proto]
             [next.jdbc :as nj]
+            [next.jdbc.prepare :as prepare]
             [next.jdbc.sql :as sql]
             [db.datasource :as ds]
             [db.driver :as driver]))
+
+(defn- batch-failure-shape [error]
+  {:class (.getName (class error))
+   :driver-cause
+   (loop [cause (.getCause error)]
+     (cond
+       (nil? cause) false
+       (:jdbc/sql-error (ex-data cause)) true
+       :else (recur (.getCause cause))))})
 
 (defn run [check]
   (println "next.jdbc surface over sqlite (:memory:)")
@@ -20,6 +30,35 @@
            (count (sql/query conn "select * from t")))
     (check "execute-batch! legacy seq-of-sql shape still runs" [0 0]
            (nj/execute-batch! conn ["create table l1 (a integer)" "create table l2 (a integer)"]))
+    (nj/execute! conn "create table next_statement_batch (id integer primary key)")
+    (let [statement (prepare/statement conn)]
+      (.addBatch statement "insert into next_statement_batch values (1)")
+      (.addBatch statement "insert into next_statement_batch values (1)")
+      (check "next.jdbc statement batch retains exact class and driver cause"
+             {:class "java.sql.BatchUpdateException" :driver-cause true}
+             (try
+               (.executeBatch statement)
+               :missed
+               (catch java.sql.BatchUpdateException error
+                 (batch-failure-shape error)))))
+    (check "next.jdbc SQL-list batch retains exact class and driver cause"
+           {:class "java.sql.BatchUpdateException" :driver-cause true}
+           (try
+             (nj/execute-batch!
+              conn ["insert into t (id, x) values (100, 100)"
+                    "insert into t (id, x) values (100, 101)"])
+             :missed
+             (catch java.sql.BatchUpdateException error
+               (batch-failure-shape error))))
+    (check "next.jdbc parameter batch retains exact class and driver cause"
+           {:class "java.sql.BatchUpdateException" :driver-cause true}
+           (try
+             (nj/execute-batch!
+              conn "insert into t (id, x) values (?, ?)"
+              [[101 100] [101 101]] {})
+             :missed
+             (catch java.sql.BatchUpdateException error
+               (batch-failure-shape error))))
 
     (check "execute-one! answers the first row" {:id 1 :x 1}
            (nj/execute-one! conn ["select * from t order by id"]))

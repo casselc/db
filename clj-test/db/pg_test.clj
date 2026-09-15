@@ -168,6 +168,56 @@
 
   (let [conn (ffi/alloc 1)
         result (ffi/alloc 1)
+        captured (atom nil)
+        handle (fake-handle conn)
+        pointer-size (ffi/sizeof :pointer)
+        int-size (ffi/sizeof :int)
+        uint-size (ffi/sizeof :uint)]
+    (try
+      (with-redefs [pg/PQexecParams
+                    (fn [_ sql n types values lengths formats result-format]
+                      ;; Capture while the driver's query scope still owns every
+                      ;; parameter allocation passed to libpq.
+                      (let [value-pointers
+                            (mapv #(ffi/read values :pointer (* % pointer-size))
+                                  (range n))]
+                        (reset! captured
+                                {:sql (ffi/ptr->string sql)
+                                 :count n
+                                 :types (mapv #(ffi/read types :uint (* % uint-size))
+                                              (range n))
+                                 :null? (ffi/null? (nth value-pointers 0))
+                                 :text (ffi/ptr->string (nth value-pointers 1))
+                                 :bytes (vec (ffi/read-array (nth value-pointers 2) 3))
+                                 :lengths (mapv #(ffi/read lengths :int (* % int-size))
+                                                (range n))
+                                 :formats (mapv #(ffi/read formats :int (* % int-size))
+                                                (range n))
+                                 :result-format result-format}))
+                      result)
+                    pg/PQresultStatus (constantly 1)
+                    pg/PQnfields (constantly 0)
+                    pg/PQntuples (constantly 0)
+                    pg/PQcmdTuples (constantly "0")
+                    pg/PQclear (constantly nil)]
+        (pg/execute-any handle "select ?, ?, ?" [nil "abc" (byte-array [0 -1 42])])
+        (check "postgres parameter arrays preserve libpq values and offsets"
+               {:sql "select $1, $2, $3"
+                :count 3
+                :types [0 0 17]
+                :null? true
+                :text "abc"
+                :bytes [0 -1 42]
+                :lengths [0 0 3]
+                :formats [0 0 1]
+                :result-format 0}
+               @captured))
+      (finally
+        (ffi/free result)
+        (ffi/free conn))))
+
+  (let [conn (ffi/alloc 1)
+        result (ffi/alloc 1)
         clears (atom 0)
         handle (fake-handle conn)]
     (try

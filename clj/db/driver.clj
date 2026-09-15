@@ -10,7 +10,8 @@
   (descriptor [driver]
     "Return {:id keyword :aliases coll :uri-prefixes coll :product-name string
     :capabilities {:transactions :none|:flat|:savepoint
-                   :generated-keys :none|:returning}
+                   :generated-keys :none|:returning
+                   :query-bytes optionally describes db.export support}
     :transaction-settings optionally describes truthful JDBC transaction
     settings as {:defaults {:isolation int :read-only boolean}
                  :isolation {jdbc-int {:transaction sql :session sql}}
@@ -29,6 +30,78 @@
 (def ^:private transaction-modes #{:none :flat :savepoint})
 (def ^:private generated-key-modes #{:none :returning})
 (defonce ^:private registry (atom {}))
+(def ^:private media-type-pattern
+  #"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,62}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,62}")
+(def ^:private extension-pattern #"[A-Za-z0-9][A-Za-z0-9_-]{0,15}")
+
+(defn- positive-integer? [value]
+  (and (integer? value) (pos? value)))
+
+(defn- invalid-query-bytes-capability! [id message data]
+  (throw (ex-info message
+                  (merge {:driver-id id
+                          :capability :query-bytes}
+                         data))))
+
+(defn- normalize-query-bytes-capability [id capability]
+  (when-not (map? capability)
+    (invalid-query-bytes-capability!
+     id "driver :query-bytes capability must be a map"
+     {:value capability}))
+  (when-not (= 1 (:version capability))
+    (invalid-query-bytes-capability!
+     id "driver :query-bytes capability requires :version 1"
+     {:version (:version capability)}))
+  (let [formats (:formats capability)
+        limits (:limits capability)]
+    (when-not (and (map? formats) (seq formats))
+      (invalid-query-bytes-capability!
+       id "driver :query-bytes capability requires at least one format"
+       {:formats formats}))
+    (doseq [[format metadata] formats]
+      (when-not (keyword? format)
+        (invalid-query-bytes-capability!
+         id "driver :query-bytes format ids must be keywords"
+         {:format format}))
+      (when-not (map? metadata)
+        (invalid-query-bytes-capability!
+         id "driver :query-bytes format metadata must be a map"
+         {:format format :metadata metadata}))
+      (let [content-type (:content-type metadata)
+            extension (:extension metadata)]
+        (when-not (and (string? content-type)
+                       (re-matches media-type-pattern content-type))
+          (invalid-query-bytes-capability!
+           id "driver :query-bytes content type is not a safe media type"
+           {:format format :field :content-type :value content-type}))
+        (when-not (and (string? extension)
+                       (re-matches extension-pattern extension))
+          (invalid-query-bytes-capability!
+           id "driver :query-bytes extension is not a short safe token"
+           {:format format :field :extension :value extension}))))
+    (when-not (map? limits)
+      (invalid-query-bytes-capability!
+       id "driver :query-bytes capability requires :limits"
+       {:limits limits}))
+    (doseq [field [:max-rows :max-bytes :default-max-rows :default-max-bytes]]
+      (when-not (positive-integer? (get limits field))
+        (invalid-query-bytes-capability!
+         id "driver :query-bytes limits must be positive integers"
+         {:field field :value (get limits field)})))
+    (doseq [[default-field maximum-field]
+            [[:default-max-rows :max-rows]
+             [:default-max-bytes :max-bytes]]]
+      (when (> (get limits default-field) (get limits maximum-field))
+        (invalid-query-bytes-capability!
+         id "driver :query-bytes default exceeds its hard limit"
+         {:field default-field
+          :value (get limits default-field)
+          :maximum (get limits maximum-field)})))
+    (when-not (keyword? (:staging capability))
+      (invalid-query-bytes-capability!
+       id "driver :query-bytes capability requires a keyword :staging mode"
+       {:staging (:staging capability)}))
+    capability))
 
 (defn- normalized-alias [x]
   (-> (if (keyword? x) (name x) (str x)) str/lower-case))
@@ -52,9 +125,14 @@
                (not (map? (:transaction-settings d))))
       (throw (ex-info "driver :transaction-settings must be a map"
                       {:driver-id id :transaction-settings (:transaction-settings d)})))
-    (assoc d
-           :aliases (set (map normalized-alias (conj (vec (:aliases d)) id)))
-           :uri-prefixes (set (map (comp str/lower-case str) (:uri-prefixes d))))))
+    (let [d (if (contains? capabilities :query-bytes)
+              (assoc-in d [:capabilities :query-bytes]
+                        (normalize-query-bytes-capability
+                         id (:query-bytes capabilities)))
+              d)]
+      (assoc d
+             :aliases (set (map normalized-alias (conj (vec (:aliases d)) id)))
+             :uri-prefixes (set (map (comp str/lower-case str) (:uri-prefixes d)))))))
 
 (defn registered
   "Return the immutable registry snapshot, keyed by driver id."

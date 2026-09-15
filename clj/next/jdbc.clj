@@ -171,6 +171,22 @@
 (defn- update-count-of [w sql params]
   (:count (shim/execute-any (shim-of w) sql params)))
 
+(defn- batch-failure [error]
+  ;; Match the host Statement paths: Jolt preserves the modeled JDBC class and
+  ;; original cause. Partial update counts await the runtime surface tracked by
+  ;; chucklehead-dev/jolt-aspect-packs#131.
+  (jolt.host/throwable "java.sql.BatchUpdateException"
+                       (str (ex-message error))
+                       error))
+
+(defn- batch-counts [items update-count]
+  (mapv (fn [item]
+          (try
+            (update-count item)
+            (catch Exception error
+              (throw (batch-failure error)))))
+        items))
+
 (defn execute-batch!
   "The upstream contract: one SQL statement run across `param-groups` (a seq of
   parameter vectors) inside the current transaction, answering the per-group
@@ -181,7 +197,7 @@
   ([connectable sqls]
    (if (and (sequential? sqls) (every? string? sqls))
      (call-with-connection connectable
-       (fn [w] (mapv (fn [s] (update-count-of w s [])) sqls)))
+       (fn [w] (batch-counts sqls #(update-count-of w % []))))
      (throw (ex-info "execute-batch!: expected a seq of SQL strings, or (execute-batch! conn sql param-groups)"
                      {:arg sqls}))))
   ([connectable sql param-groups] (execute-batch! connectable sql param-groups {}))
@@ -190,7 +206,8 @@
      (throw (ex-info "execute-batch!: sql must be a single statement; param groups carry the rows"
                      {:sql sql})))
    (call-with-connection connectable
-     (fn [w] (mapv (fn [group] (update-count-of w sql (vec group))) param-groups)))))
+     (fn [w]
+       (batch-counts param-groups #(update-count-of w sql (vec %)))))))
 
 (defn transact*
   "Run (f tx-connection) in a transaction on the connectable. Options:

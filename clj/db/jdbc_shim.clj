@@ -88,6 +88,23 @@
 (defmacro ^:private sql-try [& body]
   `(try ~@body (catch Exception e# (as-sql-error e#))))
 
+(defn extension-operation
+  "Run one complete public driver-extension operation at the JDBC boundary.
+
+  Existing SQLExceptions retain their identity. Every other Exception becomes
+  a SQLException whose cause is the original value, preserving precise ex-data
+  for callers that need structured diagnostics. The supplied function should
+  include connection conversion, driver-context preflight, invocation, and
+  public result conversion."
+  [operation]
+  (try
+    (operation)
+    (catch java.sql.SQLException error
+      (throw error))
+    (catch Exception error
+      (sql-error (or (ex-message error) "driver extension operation failed")
+                 error))))
+
 ;; --- driver-facing operations ------------------------------------------------
 (defn- driver-of [conn] (tget conn :driver))
 (defn- descriptor-of [conn] (tget conn :descriptor))
@@ -221,6 +238,14 @@
   [conn sql params]
   (run-any conn sql params))
 
+(defn- batch-failure [error]
+  ;; Jolt can model the JDBC exception class and cause today. Partial update
+  ;; counts remain unavailable until the host throwable work tracked by
+  ;; chucklehead-dev/jolt-aspect-packs#131 lands.
+  (jolt.host/throwable "java.sql.BatchUpdateException"
+                       (str (ex-message error))
+                       error))
+
 ;; --- java.sql.ResultSetMetaData ----------------------------------------------
 (defn- make-rsmeta [labels]
   (let [t (tt :jdbc/rsmeta)] (tput! t :labels labels) t))
@@ -347,11 +372,20 @@
                 nil)
    "executeBatch" (fn [self]
                     (let [conn (tget self :conn) sql (tget self :sql)]
-                      (mapv (fn [ps] (run-update conn sql ps)) (tget self :batch))))
+                      (mapv (fn [ps]
+                              (try
+                                (run-update conn sql ps)
+                                (catch Exception error
+                                  (throw (batch-failure error)))))
+                            (tget self :batch))))
 
    "setQueryTimeout" (fn [self _] nil)
    "setFetchSize"    (fn [self _] nil)
    "setMaxRows"      (fn [self n] (tput! self :max-rows n) nil)
+   ;; java.sql.Statement declares getConnection, and a PreparedStatement is one:
+   ;; clojure.jdbc's lazy cursor reads the connection back off the statement to
+   ;; decide whether it is inside a transaction.
+   "getConnection"   (fn [self] (tget self :conn))
    "close"           (fn [self] (tput! self :closed true) nil)
    "isClosed"        (fn [self] (tget self :closed))})
 
@@ -364,12 +398,27 @@
 
 (clojure.core/__register-class-methods! :jdbc/statement
   {"addBatch" (fn [self sql] (tput! self :batch (conj (tget self :batch) sql)) nil)
+   ;; A batch entry that fails raises BatchUpdateException, not a bare
+   ;; SQLException — that is the class the JVM throws and the one a caller
+   ;; catches to tell "one statement in the batch failed" from any other SQL
+   ;; error. Current Jolt preserves the driver failure as the cause, but its
+   ;; modeled throwable does not yet store BatchUpdateException update counts
+   ;; or expose getUpdateCounts. Track that runtime prerequisite in
+   ;; chucklehead-dev/jolt-aspect-packs#131; do not claim partial-count parity
+   ;; until the host throwable surface can represent it.
    "executeBatch" (fn [self]
                     (let [conn (tget self :conn)]
-                      (mapv (fn [sql] (run-update conn sql [])) (tget self :batch))))
+                      (loop [sqls (seq (tget self :batch)) counts []]
+                        (if-not sqls
+                          counts
+                          (let [c (try (run-update conn (first sqls) [])
+                                       (catch Exception e
+                                         (throw (batch-failure e))))]
+                            (recur (next sqls) (conj counts c)))))))
    "executeUpdate" (fn [self sql] (run-update (tget self :conn) sql []))
    "executeQuery" (fn [self sql] (make-resultset (run-query (tget self :conn) sql [])))
    "setQueryTimeout" (fn [self _] nil)
+   "getConnection" (fn [self] (tget self :conn))
    "close" (fn [self] (tput! self :closed true) nil)})
 
 ;; --- java.sql.DatabaseMetaData -----------------------------------------------
@@ -525,7 +574,20 @@
                    (set-transaction-setting! self :read-only :readonly (boolean v)))
    "isReadOnly"  (fn [self] (tget self :readonly))
    "setTransactionIsolation" (fn [self v]
-                               (set-transaction-setting! self :isolation :isolation v))
+                               ;; clojure.jdbc's public metadata contract expects
+                               ;; the raw JDBC setter to round-trip every standard
+                               ;; isolation constant, as jolt-lang/db historically
+                               ;; did. Keep that compatibility for direct java.sql
+                               ;; calls outside a transaction. clojure.jdbc stages
+                               ;; its transaction before invoking this method, so an
+                               ;; unsupported SQLite transaction option still fails
+                               ;; before its body or any native BEGIN.
+                               (if (or (setting-entry self :isolation v)
+                                       (tget self :tx-pending)
+                                       (tget self :tx-active))
+                                 (set-transaction-setting!
+                                  self :isolation :isolation v)
+                                 (do (tput! self :isolation v) nil)))
    "getTransactionIsolation" (fn [self] (tget self :isolation))
    "setSchema" (fn [self s]
                  (when-let [schema-sql (and s (:schema-sql (descriptor-of self)))]
@@ -577,13 +639,44 @@
 (def ^:private tag->class
   (into {} (map (fn [[c t]] [t c]) class-tags)))
 
+(defn- simple-name [c] (let [i (str/last-index-of c ".")] (if i (subs c (inc i)) c)))
+
+;; Graft these onto the class hierarchy so the NAMES are ones jolt models. That
+;; is what makes an extension written against the imported simple name — the way
+;; clojure.jdbc writes them — file under "PreparedStatement" rather than under
+;; the extending namespace, where no value could carry it.
+(jolt.host/register-class-supers! "java.sql.PreparedStatement" ["java.sql.Statement"])
+(jolt.host/register-class-supers! "java.sql.Statement" [])
+(jolt.host/register-class-supers! "java.sql.Connection" [])
+(jolt.host/register-class-supers! "java.sql.ResultSet" [])
+(jolt.host/register-class-supers! "java.sql.ResultSetMetaData" [])
+(jolt.host/register-class-supers! "java.sql.DatabaseMetaData" [])
+(jolt.host/register-class-supers! "java.sql.Savepoint" [])
+
+;; Every name one of these values answers to: its own class, its supertypes, and
+;; the SIMPLE spelling of each.
+;;
+;; The simple spellings are not decoration. A library that imports the class and
+;; extends a protocol to the bare name —
+;;
+;;     (:import java.sql.PreparedStatement)
+;;     (extend-protocol proto/IFetch PreparedStatement (fetch [stmt conn opts] …))
+;;
+;; which is exactly how clojure.jdbc's jdbc.impl is written — files that impl
+;; under the tag "PreparedStatement". A value answering only to
+;; "java.sql.PreparedStatement" never reaches it, and the extension silently does
+;; not fire: (jdbc/fetch conn stmt) died with "No method fetch in
+;; jdbc.proto/IFetch" while the fully-qualified arms next to it worked.
+(defn- shim-tags [c]
+  (into [] (mapcat (fn [n] [n (simple-name n)]))
+        (if (= c "java.sql.PreparedStatement")
+          ["java.sql.PreparedStatement" "java.sql.Statement"]
+          [c])))
+
 (clojure.core/__register-class!
   (fn [x] (and (table? x) (contains? tag->class (tget x :jolt/type))))
   (fn [x] (get tag->class (tget x :jolt/type)))
-  (fn [x] (let [c (get tag->class (tget x :jolt/type))]
-            (if (= c "java.sql.PreparedStatement")
-              ["java.sql.PreparedStatement" "java.sql.Statement"]
-              [c]))))
+  (fn [x] (shim-tags (get tag->class (tget x :jolt/type)))))
 
 ;; --- connection construction -------------------------------------------------
 
@@ -591,22 +684,48 @@
   "Driver-extension SPI. Return the registered descriptor and native state for
   an open shim connection, optionally asserting the expected driver id. Driver
   libraries use this to implement high-level operations such as chDB streaming
-  inserts without exposing a native pointer as an application API."
+  inserts without exposing a native pointer as an application API.
+
+  The optional requirements map accepts only `:capability` and `:preflight`.
+  Both are checked before a deferred transaction is started. `:preflight`
+  receives the context map and may validate an optional driver protocol or
+  operation options before BEGIN or execute-handle work."
   ([conn] (driver-context conn nil))
-  ([conn expected-id]
-   (when-not (tagged? conn :jdbc/connection)
-     (sql-error "expected a db.jdbc-shim connection"))
-   (when (tget conn :closed)
-     (sql-error "connection is closed"))
-   (let [descriptor (descriptor-of conn)]
-     (when (and expected-id (not= expected-id (:id descriptor)))
-       (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
-     ;; Driver-specific operations (DuckDB Appender, chDB streaming, etc.) bypass
-     ;; execute-handle, so crossing this extension seam must materialize the same
-     ;; deferred BEGIN/settings as an ordinary SQL statement. Validate identity
-     ;; first so a wrong-driver request has no transaction side effect.
-     (sql-try (ensure-transaction-started! conn))
-     {:driver (driver-of conn) :descriptor descriptor :handle (handle conn)})))
+  ([conn expected-id] (driver-context conn expected-id nil))
+  ([conn expected-id requirements]
+   (when-not (or (nil? requirements) (map? requirements))
+     (sql-error "driver extension requirements must be a map"))
+   (when-let [unknown (seq (remove #{:capability :preflight}
+                                   (keys requirements)))]
+     (sql-error (str "unsupported driver extension requirements: "
+                     (pr-str (vec (sort-by str unknown))))))
+   (when (and (contains? requirements :capability)
+              (not (keyword? (:capability requirements))))
+     (sql-error "driver extension :capability must be a keyword"))
+   (when (and (contains? requirements :preflight)
+              (not (ifn? (:preflight requirements))))
+     (sql-error "driver extension :preflight must be callable"))
+   (let [{:keys [capability preflight]} requirements]
+     (when-not (tagged? conn :jdbc/connection)
+       (sql-error "expected a db.jdbc-shim connection"))
+     (when (tget conn :closed)
+       (sql-error "connection is closed"))
+     (let [descriptor (descriptor-of conn)]
+       (when (and expected-id (not= expected-id (:id descriptor)))
+         (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
+       (when (and capability
+                  (not (contains? (:capabilities descriptor) capability)))
+         (unsupported
+          (str (:product-name descriptor) " does not support " (name capability))))
+       (let [context {:driver (driver-of conn)
+                      :descriptor descriptor
+                      :handle (handle conn)}]
+         (when preflight (preflight context))
+         ;; Driver-specific operations bypass execute-handle, so crossing this
+         ;; seam materializes the same deferred BEGIN/settings as ordinary SQL.
+         ;; Identity and requirements reject before that BEGIN/execute work.
+         (sql-try (ensure-transaction-started! conn))
+         context)))))
 
 (defn connection
   "Open a java.sql.Connection shim for a clojure.jdbc dbspec. Recognises the
@@ -620,3 +739,46 @@
             descriptor (driver/driver-descriptor drv)
             h (driver/open-handle drv spec)]
         (make-connection drv descriptor h)))))
+
+;; --- java.sql.DriverManager --------------------------------------------------
+;; clojure.jdbc's dbspec->connection ends at (DriverManager/getConnection url
+;; props) — the same place a JVM driver is reached through, once it has
+;; registered itself. Serving that here is what lets a program which only
+;; requires jdbc.core work.
+;;
+;; Extending proto/IConnection instead cannot do it: that extension has to load
+;; AFTER clojure.jdbc's own to win, and this namespace has to load BEFORE them,
+;; since they resolve the java.sql constants above as they compile. db.jdbc still
+;; extends IConnection for the direct (jdbc/connection spec) path; this covers the
+;; case where nothing of ours was required first.
+(defn- driver-manager-connection
+  ;; The properties argument carries the dbspec's leftover options. The native
+  ;; drivers take their settings from the uri, so it is accepted and ignored
+  ;; rather than refused — a caller that passes options gets a working connection
+  ;; instead of an error about an argument this driver has no use for.
+  ([url] (driver-manager-connection url nil))
+  ([url _props]
+   (let [u (str url)
+         u (if (str/starts-with? u "jdbc:") (subs u 5) u)
+         i (str/index-of u ":")]
+     ;; Hand the vendor and the rest to the dbspec branch above rather than
+     ;; parsing the uri again here: clojure.jdbc reaches this with the subname
+     ;; still carrying the "//" its uri->dbspec put there ("jdbc:sqlite://:memory:"),
+     ;; and that branch is what already knows to strip it.
+     (if i
+       (connection {:subprotocol (subs u 0 i) :subname (subs u (inc i))})
+       (connection u)))))
+
+(let [statics {"getConnection" driver-manager-connection}]
+  (clojure.core/__register-class-statics! "java.sql.DriverManager" statics)
+  (clojure.core/__register-class-statics! "DriverManager" statics))
+
+;; A dbspec may name its driver — {:classname "org.sqlite.JDBC"} — and
+;; clojure.jdbc does (Class/forName classname) before opening the connection. On
+;; the JVM that load is what registers the driver with DriverManager; here these
+;; drivers are already registered above, so the class only has to be FINDABLE.
+;; Registering the two names with no members is what makes Class/forName resolve
+;; them instead of throwing ClassNotFoundException — and a driver jolt does NOT
+;; back still throws, which is the answer a caller wants.
+(clojure.core/__register-class-statics! "org.sqlite.JDBC" {})
+(clojure.core/__register-class-statics! "org.postgresql.Driver" {})

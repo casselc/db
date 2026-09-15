@@ -62,7 +62,7 @@
   [path]
   (ffi/with-c-string [path-ptr path]
     (ffi/with-out [pp :pointer]
-      (ffi/write pp :pointer 0 ffi/null)
+      (ffi/write pp :pointer ffi/null)
       (let [opened (try {:rc (sqlite3-open path-ptr pp)}
                         (catch Throwable t {:error t}))
             db (ffi/read pp :pointer)]
@@ -199,7 +199,7 @@
   (let [db (live-ptr! handle)]
     (ffi/with-c-string [sql-ptr sql]
       (ffi/with-out [pp :pointer]
-        (ffi/write pp :pointer 0 ffi/null)
+        (ffi/write pp :pointer ffi/null)
         (let [prepared (try {:rc (sqlite3-prepare db sql-ptr -1 pp ffi/null)}
                             (catch Throwable t {:error t}))
               stmt (ffi/read pp :pointer)]
