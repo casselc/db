@@ -560,7 +560,20 @@
                    (set-transaction-setting! self :read-only :readonly (boolean v)))
    "isReadOnly"  (fn [self] (tget self :readonly))
    "setTransactionIsolation" (fn [self v]
-                               (set-transaction-setting! self :isolation :isolation v))
+                               ;; clojure.jdbc's public metadata contract expects
+                               ;; the raw JDBC setter to round-trip every standard
+                               ;; isolation constant, as jolt-lang/db historically
+                               ;; did. Keep that compatibility for direct java.sql
+                               ;; calls outside a transaction. clojure.jdbc stages
+                               ;; its transaction before invoking this method, so an
+                               ;; unsupported SQLite transaction option still fails
+                               ;; before its body or any native BEGIN.
+                               (if (or (setting-entry self :isolation v)
+                                       (tget self :tx-pending)
+                                       (tget self :tx-active))
+                                 (set-transaction-setting!
+                                  self :isolation :isolation v)
+                                 (do (tput! self :isolation v) nil)))
    "getTransactionIsolation" (fn [self] (tget self :isolation))
    "setSchema" (fn [self s]
                  (when-let [schema-sql (and s (:schema-sql (descriptor-of self)))]
