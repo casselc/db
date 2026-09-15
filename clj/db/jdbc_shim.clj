@@ -388,8 +388,11 @@
    ;; A batch entry that fails raises BatchUpdateException, not a bare
    ;; SQLException — that is the class the JVM throws and the one a caller
    ;; catches to tell "one statement in the batch failed" from any other SQL
-   ;; error. The counts collected before the failure travel with it, as they do
-   ;; on the JVM.
+   ;; error. Current Jolt preserves the driver failure as the cause, but its
+   ;; modeled throwable does not yet store BatchUpdateException update counts
+   ;; or expose getUpdateCounts. Track that runtime prerequisite in
+   ;; chucklehead-dev/jolt-aspect-packs#131; do not claim partial-count parity
+   ;; until the host throwable surface can represent it.
    "executeBatch" (fn [self]
                     (let [conn (tget self :conn)]
                       (loop [sqls (seq (tget self :batch)) counts []]
