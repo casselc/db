@@ -399,7 +399,8 @@
                                        (catch Exception e
                                          (throw (jolt.host/throwable
                                                  "java.sql.BatchUpdateException"
-                                                 (str (ex-message e))))))]
+                                                 (str (ex-message e))
+                                                 e))))]
                             (recur (next sqls) (conj counts c)))))))
    "executeUpdate" (fn [self sql] (run-update (tget self :conn) sql []))
    "executeQuery" (fn [self sql] (make-resultset (run-query (tget self :conn) sql [])))

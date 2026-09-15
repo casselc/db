@@ -54,6 +54,16 @@
            (try
              (jdbc/fetch conn "select * from missing_table")
              (catch Exception _ :caught)))
+    (check "batch update errors retain the driver cause" true
+           (try
+             (jdbc/execute! conn "insert into missing_table values (1)")
+             false
+             (catch java.sql.BatchUpdateException error
+               (loop [cause (.getCause error)]
+                 (cond
+                   (nil? cause) false
+                   (:jdbc/sql-error (ex-data cause)) true
+                   :else (recur (.getCause cause)))))))
     (jdbc/execute! conn "create table payload (id integer primary key, content blob not null)")
     (doseq [[label payload] [["embedded NULs" (byte-array [65 0 66 0 67])]
                              ["non-UTF-8 bytes" (byte-array [-1 -2])]
