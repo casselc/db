@@ -238,6 +238,14 @@
   [conn sql params]
   (run-any conn sql params))
 
+(defn- batch-failure [error]
+  ;; Jolt can model the JDBC exception class and cause today. Partial update
+  ;; counts remain unavailable until the host throwable work tracked by
+  ;; chucklehead-dev/jolt-aspect-packs#131 lands.
+  (jolt.host/throwable "java.sql.BatchUpdateException"
+                       (str (ex-message error))
+                       error))
+
 ;; --- java.sql.ResultSetMetaData ----------------------------------------------
 (defn- make-rsmeta [labels]
   (let [t (tt :jdbc/rsmeta)] (tput! t :labels labels) t))
@@ -364,7 +372,12 @@
                 nil)
    "executeBatch" (fn [self]
                     (let [conn (tget self :conn) sql (tget self :sql)]
-                      (mapv (fn [ps] (run-update conn sql ps)) (tget self :batch))))
+                      (mapv (fn [ps]
+                              (try
+                                (run-update conn sql ps)
+                                (catch Exception error
+                                  (throw (batch-failure error)))))
+                            (tget self :batch))))
 
    "setQueryTimeout" (fn [self _] nil)
    "setFetchSize"    (fn [self _] nil)
@@ -400,10 +413,7 @@
                           counts
                           (let [c (try (run-update conn (first sqls) [])
                                        (catch Exception e
-                                         (throw (jolt.host/throwable
-                                                 "java.sql.BatchUpdateException"
-                                                 (str (ex-message e))
-                                                 e))))]
+                                         (throw (batch-failure e))))]
                             (recur (next sqls) (conj counts c)))))))
    "executeUpdate" (fn [self sql] (run-update (tget self :conn) sql []))
    "executeQuery" (fn [self sql] (make-resultset (run-query (tget self :conn) sql [])))

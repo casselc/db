@@ -11,6 +11,7 @@
             [db.pg-test]
             [next-jdbc-test]
             [jdbc.core :as jdbc]
+            [jdbc.proto :as proto]
             ;; the placeholder rewriter lives in the pg driver; requiring it here
             ;; lets the sqlite-only run cover the lexer table. Loading db.pg does
             ;; not need libpq present, only calling into it does.
@@ -23,6 +24,13 @@
     (println "  ok  " label)
     (do (swap! failures inc)
         (println "  FAIL" label "— expected" (pr-str expected) "got" (pr-str actual)))))
+
+(defn- retains-driver-cause? [error]
+  (loop [cause (.getCause error)]
+    (cond
+      (nil? cause) false
+      (:jdbc/sql-error (ex-data cause)) true
+      :else (recur (.getCause cause)))))
 
 (defn -main [& _]
   (println "jdbc.core over sqlite (:memory:)")
@@ -59,11 +67,21 @@
              (jdbc/execute! conn "insert into missing_table values (1)")
              false
              (catch java.sql.BatchUpdateException error
-               (loop [cause (.getCause error)]
-                 (cond
-                   (nil? cause) false
-                   (:jdbc/sql-error (ex-data cause)) true
-                   :else (recur (.getCause cause)))))))
+               (retains-driver-cause? error))))
+    (jdbc/execute! conn "create table prepared_batch (id integer primary key)")
+    (let [statement (.prepareStatement
+                     (proto/connection conn)
+                     "insert into prepared_batch (id) values (?)")]
+      (.setObject statement 1 1)
+      (.addBatch statement)
+      (.setObject statement 1 1)
+      (.addBatch statement)
+      (check "prepared batch errors retain the driver cause" true
+             (try
+               (.executeBatch statement)
+               false
+               (catch java.sql.BatchUpdateException error
+                 (retains-driver-cause? error)))))
     (jdbc/execute! conn "create table payload (id integer primary key, content blob not null)")
     (doseq [[label payload] [["embedded NULs" (byte-array [65 0 66 0 67])]
                              ["non-UTF-8 bytes" (byte-array [-1 -2])]
