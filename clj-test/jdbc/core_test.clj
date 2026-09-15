@@ -32,6 +32,10 @@
       (:jdbc/sql-error (ex-data cause)) true
       :else (recur (.getCause cause)))))
 
+(defn- batch-failure-shape [error]
+  {:class (.getName (class error))
+   :driver-cause (retains-driver-cause? error)})
+
 (defn -main [& _]
   (println "jdbc.core over sqlite (:memory:)")
   (with-open [conn (jdbc/connection "sqlite::memory:")]
@@ -62,12 +66,13 @@
            (try
              (jdbc/fetch conn "select * from missing_table")
              (catch Exception _ :caught)))
-    (check "batch update errors retain the driver cause" true
+    (check "batch update errors retain their exact class and driver cause"
+           {:class "java.sql.BatchUpdateException" :driver-cause true}
            (try
              (jdbc/execute! conn "insert into missing_table values (1)")
-             false
+             :missed
              (catch java.sql.BatchUpdateException error
-               (retains-driver-cause? error))))
+               (batch-failure-shape error))))
     (jdbc/execute! conn "create table prepared_batch (id integer primary key)")
     (let [statement (.prepareStatement
                      (proto/connection conn)
@@ -76,12 +81,13 @@
       (.addBatch statement)
       (.setObject statement 1 1)
       (.addBatch statement)
-      (check "prepared batch errors retain the driver cause" true
+      (check "prepared batch errors retain their exact class and driver cause"
+             {:class "java.sql.BatchUpdateException" :driver-cause true}
              (try
                (.executeBatch statement)
-               false
+               :missed
                (catch java.sql.BatchUpdateException error
-                 (retains-driver-cause? error)))))
+                 (batch-failure-shape error)))))
     (jdbc/execute! conn "create table payload (id integer primary key, content blob not null)")
     (doseq [[label payload] [["embedded NULs" (byte-array [65 0 66 0 67])]
                              ["non-UTF-8 bytes" (byte-array [-1 -2])]

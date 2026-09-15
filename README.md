@@ -195,6 +195,19 @@ The version floor is not cosmetic. In addition to the earlier host-shim fixes,
 the native ownership paths use Jolt's lexically scoped FFI allocation helpers,
 collect-safe blocking calls, and value-first scalar writes.
 
+## Provider-convergence rollout
+
+When a downstream project pins an exact integrated commit from this repository,
+merge its provider-convergence PR with a merge commit that preserves that exact
+commit and its lineage. Do not squash or rebase it away: publish the reviewed
+commit, verify a fresh git dependency cache can resolve it, and only then open
+the downstream pinning PR.
+
+The clojure.jdbc compatibility lane is the checked-in
+`ci/clojure-jdbc-conformance.sh` script invoked explicitly by CI. There is no
+`:jolt/conformance` dependency key; adding an undocumented key would not make a
+consumer or Jolt run that suite.
+
 ## Test
 
 ```bash
