@@ -27,6 +27,8 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/jolt-lang/jolt/main/install \
             | bash -s -- --dir "$HOME/.jolt"
           echo "$HOME/.jolt" >> "$GITHUB_PATH"
+      - name: Install pinned Hegel native library
+        run: jolt -M:test:setup-hegel
       - name: Test
         run: JOLT_TEST_PG_URI=postgres://postgres:postgres@127.0.0.1:5432/jolt_test JOLT_PWD="$PWD" jolt -M:test
 
