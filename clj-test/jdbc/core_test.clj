@@ -73,6 +73,16 @@
              :missed
              (catch java.sql.BatchUpdateException error
                (batch-failure-shape error))))
+    (let [statement (.createStatement (proto/connection conn))]
+      (.addBatch statement "insert into person (id, name, zip) values (50, 'batch', 1)")
+      (.addBatch statement "insert into person (id, name, zip) values (50, 'duplicate', 2)")
+      (check "plain statement batch retains exact class and driver cause"
+             {:class "java.sql.BatchUpdateException" :driver-cause true}
+             (try
+               (.executeBatch statement)
+               :missed
+               (catch java.sql.BatchUpdateException error
+                 (batch-failure-shape error)))))
     (jdbc/execute! conn "create table prepared_batch (id integer primary key)")
     (let [statement (.prepareStatement
                      (proto/connection conn)
@@ -88,6 +98,17 @@
                :missed
                (catch java.sql.BatchUpdateException error
                  (batch-failure-shape error)))))
+    (let [raw (proto/connection conn)
+          initial (.getTransactionIsolation raw)]
+      (.setTransactionIsolation
+       raw java.sql.Connection/TRANSACTION_READ_UNCOMMITTED)
+      (check "direct isolation metadata round-trips outside a transaction"
+             java.sql.Connection/TRANSACTION_READ_UNCOMMITTED
+             (.getTransactionIsolation raw))
+      (.setTransactionIsolation raw initial)
+      (check "direct isolation metadata restores outside a transaction"
+             initial
+             (.getTransactionIsolation raw)))
     (jdbc/execute! conn "create table payload (id integer primary key, content blob not null)")
     (doseq [[label payload] [["embedded NULs" (byte-array [65 0 66 0 67])]
                              ["non-UTF-8 bytes" (byte-array [-1 -2])]
