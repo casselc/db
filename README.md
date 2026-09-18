@@ -221,3 +221,12 @@ it does not pretend that those fakes prove a native client/server exchange. Set
 `JOLT_TEST_PG_URI` to a disposable real PostgreSQL database to enable the
 existing end-to-end libpq value, parameter, transaction, and bytea checks. The
 integration suite creates and drops tables prefixed `jolt_` / `nj_`.
+
+## Change log
+
+### Unreleased
+
+- Align the canonical time dependency with the shared telemetry stack, retaining
+  JDBC's Locale support and adding the provider declaration for ZoneRules.
+  This is a dependency metadata change; database APIs are unchanged.
+  Tracks [Oscope #119](https://github.com/chucklehead-dev/oscope/issues/119).
