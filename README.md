@@ -37,6 +37,14 @@ which is what postgres' own driver gives; a sequence of column names asks for
 those. Without it there are no generated keys to report, so `insert!` falls back
 to the update count, exactly as clojure.jdbc does on a driver that has none.
 
+## Changelog
+
+### Unreleased
+
+- PostgreSQL test headings omit the connection URI, which may contain credentials.
+  A synthetic canary checks the actual heading before backend tests run. Connection
+  arguments, stored values, and PostgreSQL test coverage are unchanged.
+
 ## Binary values
 
 A byte array parameter binds as a SQLite `blob` / postgres `bytea`, and those
