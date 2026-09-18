@@ -214,7 +214,7 @@
       (check (str "placeholders, half a megabyte stays linear (" ms " ms)") true (< ms 5000))))
 
   (when-let [pg-uri (System/getenv "JOLT_TEST_PG_URI")]
-    (println "jdbc.core over postgres (" pg-uri ")")
+    (println "jdbc.core over postgres")
     (with-open [conn (jdbc/connection pg-uri)]
       (jdbc/execute! conn "drop table if exists jolt_person")
       (jdbc/execute! conn "create table jolt_person (id serial primary key, name text, zip integer)")

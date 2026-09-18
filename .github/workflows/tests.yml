@@ -27,6 +27,8 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/jolt-lang/jolt/main/install \
             | bash -s -- --dir "$HOME/.jolt"
           echo "$HOME/.jolt" >> "$GITHUB_PATH"
+      - name: Check PostgreSQL test diagnostic privacy
+        run: jolt -Srepro ci/pg-uri-diagnostic-test.clj
       - name: Install pinned Hegel native library
         run: jolt -M:test:setup-hegel
       - name: Test
