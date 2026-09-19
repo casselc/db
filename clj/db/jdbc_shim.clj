@@ -699,7 +699,9 @@
      (when (and expected-id (not= expected-id (:id descriptor)))
        (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
      (let [native-handle (handle conn)]
-       (when-not native-handle
+       ;; `Driver/open-handle` owns this opaque value. Its contract rules out
+       ;; nil, not false: a driver may deliberately use false as its state.
+       (when (nil? native-handle)
          (sql-error "connection has no native driver handle"))
        {:driver (driver-of conn)
         :descriptor descriptor
