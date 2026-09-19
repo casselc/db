@@ -238,7 +238,25 @@
           (shim/driver-context (proto/connection conn) :tx-settings))
         (check "driver extension context materializes a pending transaction"
                ["BEGIN" "COMMIT"]
-               (mapv second (filter #(= :execute (first %)) @calls))))
+               (mapv second (filter #(= :execute (first %)) @calls)))
+        (reset! calls [])
+        (jdbc/atomic conn
+          (let [context (shim/read-only-driver-context
+                         (proto/connection conn) :tx-settings)]
+            (check "read-only driver context retains the native handle"
+                   true (some? (:handle context)))))
+        (check "read-only driver context never materializes BEGIN or settings"
+               [] (filterv #(= :execute (first %)) @calls))
+        (reset! calls [])
+        (check "read-only driver context rejects a different driver before I/O"
+               :rejected
+               (try
+                 (shim/read-only-driver-context
+                  (proto/connection conn) :not-tx-settings)
+                 :accepted
+                 (catch java.sql.SQLException _ :rejected)))
+        (check "read-only context identity rejection does not materialize BEGIN"
+               [] (filterv #(= :execute (first %)) @calls)))
       (finally (driver/unregister! :tx-settings))))
 
   (let [calls (atom [])

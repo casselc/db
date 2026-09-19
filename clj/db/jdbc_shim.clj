@@ -680,6 +680,31 @@
 
 ;; --- connection construction -------------------------------------------------
 
+(defn read-only-driver-context
+  "Return the registered descriptor and native state for an open shim
+  connection without starting a deferred transaction.
+
+  This is deliberately narrower than `driver-context`: it validates only the
+  shim connection, its open state, the expected driver id, and the existing
+  native handle. It has no requirements/preflight surface and must be used only
+  by driver extensions whose operation is an in-memory observation. In
+  particular, it never materializes deferred BEGIN or transaction settings."
+  ([conn] (read-only-driver-context conn nil))
+  ([conn expected-id]
+   (when-not (tagged? conn :jdbc/connection)
+     (sql-error "expected a db.jdbc-shim connection"))
+   (when (tget conn :closed)
+     (sql-error "connection is closed"))
+   (let [descriptor (descriptor-of conn)]
+     (when (and expected-id (not= expected-id (:id descriptor)))
+       (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
+     (let [native-handle (handle conn)]
+       (when-not native-handle
+         (sql-error "connection has no native driver handle"))
+       {:driver (driver-of conn)
+        :descriptor descriptor
+        :handle native-handle}))))
+
 (defn driver-context
   "Driver-extension SPI. Return the registered descriptor and native state for
   an open shim connection, optionally asserting the expected driver id. Driver
