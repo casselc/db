@@ -18,7 +18,9 @@
                  :read-only {boolean {:transaction sql :session sql}}}.
     Missing setting metadata means explicit transaction options are unsupported.
     :constraints optional driver-specific operational constraints}.")
-  (open-handle [driver spec] "Open `spec` and return driver-owned state.")
+  (open-handle [driver spec]
+    "Open `spec` and return non-nil driver-owned state. The state need not be
+    truthy: `false` is a valid opaque handle value.")
   (close-handle [driver handle] "Close driver-owned state. Called at most once.")
   (execute-handle [driver handle sql params]
     "Execute exactly once and return an eager positional result

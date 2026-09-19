@@ -238,8 +238,100 @@
           (shim/driver-context (proto/connection conn) :tx-settings))
         (check "driver extension context materializes a pending transaction"
                ["BEGIN" "COMMIT"]
-               (mapv second (filter #(= :execute (first %)) @calls))))
+               (mapv second (filter #(= :execute (first %)) @calls)))
+        (reset! calls [])
+        (jdbc/atomic conn
+          (let [context (shim/read-only-driver-context
+                         (proto/connection conn) :tx-settings)]
+            (check "read-only driver context retains the native handle"
+                   true (some? (:handle context)))))
+        (check "read-only driver context never materializes BEGIN or settings"
+               [] (filterv #(= :execute (first %)) @calls))
+        (reset! calls [])
+        (check "read-only driver context rejects a different driver before I/O"
+               :rejected
+               (try
+                 (shim/read-only-driver-context
+                  (proto/connection conn) :not-tx-settings)
+                 :accepted
+                 (catch java.sql.SQLException _ :rejected)))
+        (check "read-only context identity rejection does not materialize BEGIN"
+               [] (filterv #(= :execute (first %)) @calls)))
       (finally (driver/unregister! :tx-settings))))
+
+  ;; `Driver/open-handle` returns opaque, non-nil state. In particular, false
+  ;; is state, not absence. Nil is rejected while constructing the JDBC shim,
+  ;; before it can be handed to a caller, executed, or closed.
+  (let [calls (atom [])
+        false-handle-driver
+        (reify driver/Driver
+          (descriptor [_]
+            (descriptor :false-handle #{"false-handle"} ["false-handle:"]
+                        :none :none "FalseHandle"))
+          (open-handle [_ spec]
+            (swap! calls conj [:open spec])
+            false)
+          (close-handle [_ handle]
+            (swap! calls conj [:close handle])
+            nil)
+          (execute-handle [_ handle sql params]
+            ;; This stands in for the native edge: read-only context lookup
+            ;; must never arrive here on either rejected control.
+            (swap! calls conj [:execute handle sql (vec params)])
+            {:labels [] :rows [] :count 0}))]
+    (try
+      (driver/register! false-handle-driver)
+      (let [conn (jdbc/connection "false-handle:value")
+            raw (proto/connection conn)]
+        (try
+          (check "read-only driver context accepts false opaque handle" false
+                 (:handle (shim/read-only-driver-context raw :false-handle)))
+          (check "false opaque handle remains executable" 0
+                 (jdbc/execute! conn "update false_handle set value = 1"))
+          (.close raw)
+          (check "false opaque handle reaches close once"
+                 [[:open "false-handle:value"]
+                  [:execute false "update false_handle set value = 1" []]
+                  [:close false]]
+                 @calls)
+          (reset! calls [])
+          (check "read-only context rejects a closed connection" :rejected
+                 (try
+                   (shim/read-only-driver-context raw :false-handle)
+                   :accepted
+                   (catch java.sql.SQLException _ :rejected)))
+          (check "closed read-only context performs zero driver/native I/O"
+                 [] @calls)
+          (finally
+            (.close raw))))
+      (let [nil-handle-driver
+            (reify driver/Driver
+              (descriptor [_]
+                (descriptor :nil-handle #{"nil-handle"} ["nil-handle:"]
+                            :none :none "NilHandle"))
+              (open-handle [_ spec]
+                (swap! calls conj [:open spec])
+                nil)
+              (close-handle [_ handle]
+                (swap! calls conj [:close handle])
+                nil)
+              (execute-handle [_ handle sql params]
+                (swap! calls conj [:execute handle sql (vec params)])
+                {:labels [] :rows [] :count 0}))]
+        (driver/register! nil-handle-driver)
+        (try
+          (check "nil open handle rejects connection construction" :rejected
+                 (try
+                   (jdbc/connection "nil-handle:value")
+                   :accepted
+                   (catch java.sql.SQLException _ :rejected)))
+          (check "nil open handle cannot execute or close through a JDBC connection"
+                 [[:open "nil-handle:value"]]
+                 @calls)
+          (finally
+            (driver/unregister! :nil-handle))))
+      (finally
+        (driver/unregister! :false-handle))))
 
   (let [calls (atom [])
         legacy (fake-driver (descriptor :tx-legacy #{"tx-legacy"} ["tx-legacy:"]
