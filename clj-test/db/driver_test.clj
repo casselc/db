@@ -260,8 +260,8 @@
       (finally (driver/unregister! :tx-settings))))
 
   ;; `Driver/open-handle` returns opaque, non-nil state. In particular, false
-  ;; is state, not absence. These controls also prove the read-only observer
-  ;; rejects unusable connections before it can execute driver/native work.
+  ;; is state, not absence. Nil is rejected while constructing the JDBC shim,
+  ;; before it can be handed to a caller, executed, or closed.
   (let [calls (atom [])
         false-handle-driver
         (reify driver/Driver
@@ -286,7 +286,14 @@
         (try
           (check "read-only driver context accepts false opaque handle" false
                  (:handle (shim/read-only-driver-context raw :false-handle)))
+          (check "false opaque handle remains executable" 0
+                 (jdbc/execute! conn "update false_handle set value = 1"))
           (.close raw)
+          (check "false opaque handle reaches close once"
+                 [[:open "false-handle:value"]
+                  [:execute false "update false_handle set value = 1" []]
+                  [:close false]]
+                 @calls)
           (reset! calls [])
           (check "read-only context rejects a closed connection" :rejected
                  (try
@@ -313,19 +320,14 @@
                 {:labels [] :rows [] :count 0}))]
         (driver/register! nil-handle-driver)
         (try
-          (let [conn (jdbc/connection "nil-handle:value")
-                raw (proto/connection conn)]
-            (try
-              (reset! calls [])
-              (check "read-only context rejects a nil handle" :rejected
-                     (try
-                       (shim/read-only-driver-context raw :nil-handle)
-                       :accepted
-                       (catch java.sql.SQLException _ :rejected)))
-              (check "nil-handle read-only context performs zero driver/native I/O"
-                     [] @calls)
-              (finally
-                (.close raw))))
+          (check "nil open handle rejects connection construction" :rejected
+                 (try
+                   (jdbc/connection "nil-handle:value")
+                   :accepted
+                   (catch java.sql.SQLException _ :rejected)))
+          (check "nil open handle cannot execute or close through a JDBC connection"
+                 [[:open "nil-handle:value"]]
+                 @calls)
           (finally
             (driver/unregister! :nil-handle))))
       (finally

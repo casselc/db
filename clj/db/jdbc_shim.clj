@@ -435,6 +435,13 @@
 ;; understand. BEGIN is deferred until the first ordinary or driver-extension
 ;; operation so every requested setting can be validated before any SQL runs.
 (defn- make-connection [drv descriptor handle]
+  ;; A driver may use false as opaque state, but nil can never represent an
+  ;; open resource. Reject it at the construction boundary: otherwise the shim
+  ;; would hand callers a superficially usable Connection which could reach
+  ;; execute-handle or close-handle before a driver-specific extension notices
+  ;; the broken SPI result.
+  (when (nil? handle)
+    (sql-error "driver returned no native connection handle"))
   (let [t (tt :jdbc/connection)
         defaults (get-in descriptor [:transaction-settings :defaults])]
     (tput! t :vendor (:id descriptor))
@@ -699,8 +706,9 @@
      (when (and expected-id (not= expected-id (:id descriptor)))
        (sql-error (str "expected " expected-id " connection, got " (:id descriptor))))
      (let [native-handle (handle conn)]
-       ;; `Driver/open-handle` owns this opaque value. Its contract rules out
-       ;; nil, not false: a driver may deliberately use false as its state.
+       ;; Construction rejects nil from `Driver/open-handle`; retain this
+       ;; check as a defensive guard for malformed/internal shim objects. A
+       ;; driver may deliberately use false as its opaque state.
        (when (nil? native-handle)
          (sql-error "connection has no native driver handle"))
        {:driver (driver-of conn)
