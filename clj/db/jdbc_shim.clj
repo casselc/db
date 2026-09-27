@@ -680,15 +680,20 @@
           ["java.sql.PreparedStatement" "java.sql.Statement"]
           [c])))
 
+(def ^:private registrar-arity-mask
+  ;; The registrar is a native Scheme procedure, not an arbitrary application
+  ;; IFn. Query its supported arities before invoking it; never infer support
+  ;; from an exception that could originate inside registration itself.
+  (jolt.host/scheme-proc "procedure-arity-mask"))
+
 (defn- register-shim-class!
   [register! predicate class-fn tags-fn]
   ;; JDBC values are host tables. The optional domain suppresses even rebound
   ;; helper effects outside that representation, without freezing in-domain
   ;; callbacks. Older runtimes lack the fourth arity; keep their legacy behavior.
-  (try
+  (if (bit-test (registrar-arity-mask register!) 4)
     (register! predicate class-fn tags-fn :host-table)
-    (catch clojure.lang.ArityException _
-      (register! predicate class-fn tags-fn))))
+    (register! predicate class-fn tags-fn)))
 
 (register-shim-class!
   clojure.core/__register-class!

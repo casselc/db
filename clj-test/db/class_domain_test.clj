@@ -22,7 +22,19 @@
                    nil
                    (catch Exception e e))]
       (check "non-arity registration errors are propagated" true (identical? error caught))
-      (check "non-arity failures do not retry registration" [:attempt] @calls))))
+      (check "non-arity failures do not retry registration" [:attempt] @calls))
+    (reset! calls [])
+    (let [caught (try
+                   (register (fn [& _]
+                               (swap! calls conj :attempt)
+                               ;; This fails INSIDE a registrar that accepts four
+                               ;; arguments, not at the outer invocation boundary.
+                               ((fn [x] x)))
+                             predicate class-fn tags-fn)
+                   nil
+                   (catch clojure.lang.ArityException e e))]
+      (check "internal registrar arity errors propagate" true (some? caught))
+      (check "internal arity errors never retry registration" [:attempt] @calls))))
 
 (defn -main [& _]
   (let [failures (atom [])]
